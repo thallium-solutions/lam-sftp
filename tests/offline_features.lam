@@ -1,0 +1,130 @@
+# expect: folder/report.txt
+# expect: report.txt
+# expect: acme:none
+# expect: false:-1:0:true
+# expect: true:false:false
+# expect: true:true:false
+# expect: true:true:true:/folder/report.txt
+# expect: 127.0.0.1:0:1048576:2097152:65536:10:2000:3000:5:8
+# expect: true
+# expect: false
+# expect: true
+# expect: 1:1
+# expect: false
+# expect: 2:2
+# expect: false
+# expect: true:Mkdir
+# expect: true:Remove
+# expect: true:1
+
+from @lam/sftp import SftpAuth, SftpConfig, SftpFile, SftpHandlers, SftpRequest, SftpServer, SftpStatVFS
+from lamcontext import Context
+from lamerrors import Result
+
+class MemoryStorage {
+    func read(self, _request: SftpRequest) -> Result[list[int]] {
+        return Result.Ok([1, 2, 3])
+    }
+
+    func write(self, _request: SftpRequest, data: list[int]) -> Result[int] {
+        return Result.Ok(len(data))
+    }
+
+    func list(self, _request: SftpRequest) -> Result[list[SftpFile]] {
+        return Result.Ok([])
+    }
+
+    func command(self, _request: SftpRequest) -> Result[bool] {
+        return Result.Ok(true)
+    }
+}
+
+class Probe {
+    func __init__(self) {
+        self.requests: int = 0
+        self.results: int = 0
+        self.errors: int = 0
+        self.lastMethod: str = ""
+    }
+
+    func request(self, _request: SftpRequest) {
+        self.requests += 1
+    }
+
+    func result(self, _request: SftpRequest, _result: Result) {
+        self.results += 1
+    }
+
+    func guard(self, request: SftpRequest) -> Result[bool] {
+        return Result.Ok(request.user != "blocked")
+    }
+
+    func mkdir(self, request: SftpRequest) -> Result[bool] {
+        self.lastMethod = request.method
+        return Result.Ok(true)
+    }
+
+    func error(self, _error: any) {
+        self.errors += 1
+    }
+}
+
+func allowAuth(_auth: SftpAuth) -> bool {
+    return true
+}
+
+func main() {
+    request: SftpRequest = SftpRequest()
+    request.method = "Get"
+    request.path = "/folder/report.txt"
+    request.session["tenant"] = "acme"
+    print(request.key())
+    print(request.basename())
+    print(f"{request.sessionValue('tenant')}:{request.sessionValue('missing', 'none')}")
+    requestContext: Context = request.context()
+    print(f"{requestContext.expired()}:{requestContext.expiresIn(None)}:{request.deadlineUnix()}:{not request.cancelled()}")
+    print(f"{request.isReadOperation()}:{request.isWriteOperation()}:{request.isCommandOperation()}")
+    request.method = "Open"
+    request.read = true
+    request.write = true
+    print(f"{request.isReadOperation()}:{request.isWriteOperation()}:{request.isCommandOperation()}")
+    request.method = "Get"
+
+    file: SftpFile = SftpFile.file("report.txt", 8).at("/folder/report.txt")
+    print(f"{file.isFile()}:{not file.isDirectory()}:{not file.isSymlink()}:{file.path}")
+
+    config: SftpConfig = SftpConfig("key").withAddress("127.0.0.1:0").withReadLimit(1048576).withWriteLimit(2097152).withPacketSize(65536).withConnectionLimit(10).withTimeouts(2000, 3000).withAuthRateLimit(5, 8)
+    print(f"{config.address}:{config.maxReadBytes}:{config.maxWriteBytes}:{config.maxPacketBytes}:{config.maxConnections}:{config.handshakeTimeoutMs}:{config.idleTimeoutMs}:{config.authAttemptsPerSecond}:{config.authBurst}")
+    config = config.addHostKey("second-key")
+    print(len(config.hostKeys) == 2)
+    print(SftpStatVFS(-1).validate().ok())
+
+    probe: Probe = Probe()
+    handlers: SftpHandlers = SftpHandlers().useStorage(MemoryStorage())
+    _ = handlers.onRequest(probe.request).onResult(probe.result).guard(probe.guard)
+
+    print(handlers.dispatchRead(request).ok())
+    print(f"{probe.requests}:{probe.results}")
+
+    request.user = "blocked"
+    print(handlers.dispatchRead(request).ok())
+    print(f"{probe.requests}:{probe.results}")
+
+    request.user = "allowed"
+    request.method = "Put"
+    _ = handlers.setReadOnly()
+    print(handlers.dispatchWrite(request, [1]).ok())
+
+    _ = handlers.setReadOnly(false).onMkdir(probe.mkdir)
+    request.method = "Mkdir"
+    print(f"{handlers.dispatchCommand(request).ok()}:{probe.lastMethod}")
+
+    request.method = "Remove"
+    print(f"{handlers.dispatchCommand(request).ok()}:{request.method}")
+
+    config = config.productionMode()
+    server: SftpServer = SftpServer(config, handlers)
+    server = server.onPasswordAuth(allowAuth)
+    server = server.onError(probe.error)
+    print(f"{not server.tryListenBackground().ok()}:{probe.errors}")
+}

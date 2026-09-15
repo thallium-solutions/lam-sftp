@@ -1,0 +1,885 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamerrors import Result, Error
+from .models import SftpAuth, SftpExtended, SftpFile, SftpRequest, SftpStatVFS
+from .handlers import SftpHandlers
+
+go! {
+    import (
+        "bytes"
+        "errors"
+        "fmt"
+        "io"
+        "net"
+        "os"
+        "path"
+        "strings"
+        "sync"
+        "time"
+
+        pkgsftp "github.com/pkg/sftp"
+        "golang.org/x/crypto/ssh"
+    )
+
+    var lamSftpExtensionsOnce sync.Once
+    var lamSftpExtensionsError error
+
+    func lamSftpConfigureExtensions() error {
+        lamSftpExtensionsOnce.Do(func() {
+            lamSftpExtensionsError = pkgsftp.SetSFTPExtensions(
+                "hardlink@openssh.com",
+                "posix-rename@openssh.com",
+                "statvfs@openssh.com",
+            )
+        })
+        return lamSftpExtensionsError
+    }
+
+    type lamSftpRuntime struct {
+        mu             sync.Mutex
+        listener       net.Listener
+        conns          map[net.Conn]struct{}
+        closed         bool
+        finished       chan struct{}
+        sshConfig      *ssh.ServerConfig
+        maxConnections int
+        idleTimeout    time.Duration
+        wg             sync.WaitGroup
+    }
+
+    func (rt *lamSftpRuntime) add(conn net.Conn) bool {
+        rt.mu.Lock()
+        defer rt.mu.Unlock()
+        if rt.closed || (rt.maxConnections > 0 && len(rt.conns) >= rt.maxConnections) {
+            return false
+        }
+        rt.conns[conn] = struct{}{}
+        rt.wg.Add(1)
+        return true
+    }
+
+    func (rt *lamSftpRuntime) remove(conn net.Conn) {
+        rt.mu.Lock()
+        delete(rt.conns, conn)
+        rt.mu.Unlock()
+        rt.wg.Done()
+    }
+
+    func (rt *lamSftpRuntime) stop() {
+        rt.mu.Lock()
+        if rt.closed {
+            rt.mu.Unlock()
+            return
+        }
+        rt.closed = true
+        listener := rt.listener
+        conns := make([]net.Conn, 0, len(rt.conns))
+        for conn := range rt.conns {
+            conns = append(conns, conn)
+        }
+        rt.mu.Unlock()
+        if listener != nil {
+            _ = listener.Close()
+        }
+        for _, conn := range conns {
+            _ = conn.Close()
+        }
+    }
+
+    func (rt *lamSftpRuntime) isClosed() bool {
+        rt.mu.Lock()
+        defer rt.mu.Unlock()
+        return rt.closed
+    }
+
+    type lamSftpDeadlineConn struct {
+        net.Conn
+        mu      sync.RWMutex
+        timeout time.Duration
+    }
+
+    func (conn *lamSftpDeadlineConn) currentTimeout() time.Duration {
+        conn.mu.RLock()
+        defer conn.mu.RUnlock()
+        return conn.timeout
+    }
+
+    func (conn *lamSftpDeadlineConn) setTimeout(timeout time.Duration) {
+        conn.mu.Lock()
+        conn.timeout = timeout
+        conn.mu.Unlock()
+        _ = conn.Conn.SetDeadline(time.Time{})
+    }
+
+    func (conn *lamSftpDeadlineConn) Read(data []byte) (int, error) {
+        if timeout := conn.currentTimeout(); timeout > 0 {
+            _ = conn.Conn.SetReadDeadline(time.Now().Add(timeout))
+        }
+        return conn.Conn.Read(data)
+    }
+
+    func (conn *lamSftpDeadlineConn) Write(data []byte) (int, error) {
+        if timeout := conn.currentTimeout(); timeout > 0 {
+            _ = conn.Conn.SetWriteDeadline(time.Now().Add(timeout))
+        }
+        return conn.Conn.Write(data)
+    }
+
+    type lamSftpFileInfo struct {
+        file *SftpFile
+    }
+
+    func (info lamSftpFileInfo) Name() string {
+        if info.file.Name != "" {
+            return info.file.Name
+        }
+        name := path.Base(info.file.Path)
+        if name == "." || name == "/" {
+            return info.file.Path
+        }
+        return name
+    }
+
+    func (info lamSftpFileInfo) Size() int64 {
+        return int64(info.file.Size)
+    }
+
+    func (info lamSftpFileInfo) Mode() os.FileMode {
+        mode := os.FileMode(info.file.Permissions)
+        switch strings.ToLower(info.file.Kind) {
+        case "directory", "dir":
+            mode |= os.ModeDir
+        case "symlink", "link":
+            mode |= os.ModeSymlink
+        }
+        return mode
+    }
+
+    func (info lamSftpFileInfo) ModTime() time.Time {
+        return time.Unix(int64(info.file.ModifiedUnix), 0)
+    }
+
+    func (info lamSftpFileInfo) IsDir() bool {
+        kind := strings.ToLower(info.file.Kind)
+        return kind == "directory" || kind == "dir"
+    }
+
+    func (info lamSftpFileInfo) Sys() interface{} {
+        return nil
+    }
+
+    func (info lamSftpFileInfo) Uid() uint32 {
+        return uint32(info.file.Uid)
+    }
+
+    func (info lamSftpFileInfo) Gid() uint32 {
+        return uint32(info.file.Gid)
+    }
+
+    func (info lamSftpFileInfo) Extended() []pkgsftp.StatExtended {
+        values := make([]pkgsftp.StatExtended, 0, len(info.file.Extended))
+        for _, item := range info.file.Extended {
+            if item != nil {
+                values = append(values, pkgsftp.StatExtended{ExtType: item.Name, ExtData: item.Data})
+            }
+        }
+        return values
+    }
+
+    type lamSftpLister []os.FileInfo
+
+    func (items lamSftpLister) ListAt(target []os.FileInfo, offset int64) (int, error) {
+        if offset >= int64(len(items)) {
+            return 0, io.EOF
+        }
+        count := copy(target, items[offset:])
+        if count < len(target) {
+            return count, io.EOF
+        }
+        return count, nil
+    }
+
+    type lamSftpWriteBuffer struct {
+        mu          sync.Mutex
+        backend     *lamSftpBackend
+        request     *SftpRequest
+        data        []byte
+        maxBytes    int
+        closed      bool
+        dirty       bool
+        transferErr error
+    }
+
+    func (writer *lamSftpWriteBuffer) ReadAt(target []byte, offset int64) (int, error) {
+        writer.mu.Lock()
+        defer writer.mu.Unlock()
+        return bytes.NewReader(writer.data).ReadAt(target, offset)
+    }
+
+    func (writer *lamSftpWriteBuffer) WriteAt(data []byte, offset int64) (int, error) {
+        writer.mu.Lock()
+        defer writer.mu.Unlock()
+        if writer.closed {
+            return 0, os.ErrClosed
+        }
+        if offset < 0 {
+            writer.transferErr = os.ErrInvalid
+            return 0, writer.transferErr
+        }
+        end := offset + int64(len(data))
+        if end < offset || end > int64(^uint(0)>>1) {
+            writer.transferErr = os.ErrInvalid
+            return 0, writer.transferErr
+        }
+        if writer.maxBytes > 0 && end > int64(writer.maxBytes) {
+            writer.transferErr = fmt.Errorf("write exceeds maxWriteBytes (%d)", writer.maxBytes)
+            return 0, writer.transferErr
+        }
+        if int(end) > len(writer.data) {
+            writer.data = append(writer.data, make([]byte, int(end)-len(writer.data))...)
+        }
+        copy(writer.data[int(offset):int(end)], data)
+        writer.dirty = true
+        return len(data), nil
+    }
+
+    func (writer *lamSftpWriteBuffer) TransferError(err error) {
+        writer.mu.Lock()
+        writer.transferErr = err
+        writer.mu.Unlock()
+    }
+
+    func (writer *lamSftpWriteBuffer) Close() error {
+        writer.mu.Lock()
+        if writer.closed {
+            writer.mu.Unlock()
+            return nil
+        }
+        writer.closed = true
+        transferErr := writer.transferErr
+        dirty := writer.dirty
+        data := append([]byte(nil), writer.data...)
+        writer.mu.Unlock()
+        if transferErr != nil {
+            return transferErr
+        }
+        if !dirty {
+            return nil
+        }
+        result := writer.backend.write(writer.request, data)
+        return lamSftpResultError(result)
+    }
+
+    type lamSftpStreamingHandle struct {
+        mu          sync.Mutex
+        backend     *lamSftpBackend
+        request     *SftpRequest
+        readable    bool
+        writable    bool
+        closed      bool
+        transferErr error
+    }
+
+    func (handle *lamSftpStreamingHandle) ReadAt(target []byte, offset int64) (count int, err error) {
+        defer func() {
+            if recovered := recover(); recovered != nil {
+                count = 0
+                err = fmt.Errorf("stream read callback panicked: %v", recovered)
+            }
+        }()
+        if !handle.readable || offset < 0 {
+            return 0, os.ErrInvalid
+        }
+        result := handle.backend.handlers.DispatchReadAt(handle.request, int(offset), len(target))
+        data, err := lamSftpBytes(result, len(target))
+        if err != nil {
+            return 0, err
+        }
+        count = copy(target, data)
+        handle.backend.handlers.Metrics.BytesRead.Add(count)
+        if count < len(target) {
+            return count, io.EOF
+        }
+        return count, nil
+    }
+
+    func (handle *lamSftpStreamingHandle) WriteAt(data []byte, offset int64) (count int, err error) {
+        defer func() {
+            if recovered := recover(); recovered != nil {
+                count = 0
+                err = fmt.Errorf("stream write callback panicked: %v", recovered)
+            }
+        }()
+        if !handle.writable || offset < 0 {
+            return 0, os.ErrInvalid
+        }
+        values := make([]int, len(data))
+        for index, value := range data {
+            values[index] = int(value)
+        }
+        result := handle.backend.handlers.DispatchWriteAt(handle.request, values, int(offset))
+        if err := lamSftpResultError(result); err != nil {
+            handle.TransferError(err)
+            return 0, err
+        }
+        count, ok := result.Value.(int)
+        if !ok || count < 0 || count > len(data) {
+            err = errors.New("writeAt callback must return Result[int] within the input length")
+            handle.TransferError(err)
+            return 0, err
+        }
+        if count != len(data) {
+            err = fmt.Errorf("writeAt callback wrote %d of %d bytes", count, len(data))
+            handle.TransferError(err)
+            return 0, err
+        }
+        handle.backend.handlers.Metrics.BytesWritten.Add(count)
+        return count, nil
+    }
+
+    func (handle *lamSftpStreamingHandle) TransferError(err error) {
+        handle.mu.Lock()
+        handle.transferErr = err
+        handle.mu.Unlock()
+        func() {
+            defer func() { _ = recover() }()
+            handle.backend.handlers.TransferErrorCallback(handle.request, err)
+        }()
+    }
+
+    func (handle *lamSftpStreamingHandle) Close() (err error) {
+        defer func() {
+            if recovered := recover(); recovered != nil {
+                err = fmt.Errorf("stream close callback panicked: %v", recovered)
+            }
+        }()
+        handle.mu.Lock()
+        if handle.closed {
+            handle.mu.Unlock()
+            return nil
+        }
+        handle.closed = true
+        transferErr := handle.transferErr
+        handle.mu.Unlock()
+        if handle.readable {
+            if closeErr := lamSftpResultError(handle.backend.handlers.DispatchCloseRead(handle.request)); closeErr != nil && err == nil {
+                err = closeErr
+            }
+        }
+        if handle.writable && transferErr == nil {
+            if closeErr := lamSftpResultError(handle.backend.handlers.DispatchCloseWrite(handle.request)); closeErr != nil && err == nil {
+                err = closeErr
+            }
+        }
+        if transferErr != nil {
+            return transferErr
+        }
+        return err
+    }
+
+    type lamSftpBackend struct {
+        handlers *SftpHandlers
+        user     string
+        remote   string
+        session  map[string]string
+        startDir string
+        maxRead  int
+        maxWrite int
+    }
+
+    func lamSftpFailure(kind string, message string) *Result {
+        return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(kind, message, nil))
+    }
+
+    func lamSftpResultError(result *Result) error {
+        if result == nil {
+            return errors.New("SFTP callback returned no Result")
+        }
+        if result.Ok() {
+            return nil
+        }
+        message := fmt.Sprint(result.Error)
+        kind := ""
+        if structured, ok := result.Error.(*Error); ok && structured != nil {
+            kind = strings.ToLower(structured.Kind)
+            message = structured.Message
+        }
+        switch kind {
+        case "notfound", "nosuchfile", "sftpnotfound":
+            return fmt.Errorf("%w: %s", pkgsftp.ErrSSHFxNoSuchFile, message)
+        case "permissiondenied", "forbidden", "sftppermissiondenied":
+            return fmt.Errorf("%w: %s", pkgsftp.ErrSSHFxPermissionDenied, message)
+        case "alreadyexists", "exists", "sftpalreadyexists":
+            return fmt.Errorf("%w: %s", pkgsftp.ErrSSHFxFailure, message)
+        case "invalid", "invalidrequest", "sftpinvalid":
+            return fmt.Errorf("%w: %s", pkgsftp.ErrSSHFxBadMessage, message)
+        case "unsupported", "sftpunsupported":
+            return fmt.Errorf("%w: %s", pkgsftp.ErrSSHFxOpUnsupported, message)
+        case "eof", "sftpeof":
+            return io.EOF
+        case "noconnection", "sftpnoconnection":
+            return fmt.Errorf("%w: %s", pkgsftp.ErrSSHFxNoConnection, message)
+        case "connectionlost", "sftpconnectionlost":
+            return fmt.Errorf("%w: %s", pkgsftp.ErrSSHFxConnectionLost, message)
+        case "failure", "sftpfailure":
+            return fmt.Errorf("%w: %s", pkgsftp.ErrSSHFxFailure, message)
+        }
+        return errors.New(message)
+    }
+
+    func lamSftpRequest(raw *pkgsftp.Request, backend *lamSftpBackend) *SftpRequest {
+        request := NewSftpRequest()
+        request.Method = raw.Method
+        request.Path = raw.Filepath
+        request.Target = raw.Target
+        request.User = backend.user
+        request.RemoteAddress = backend.remote
+        request._context = raw.Context()
+        request.Session = make(map[string]string, len(backend.session))
+        for key, value := range backend.session {
+            request.Session[key] = value
+        }
+        flags := raw.Pflags()
+        request.Read = flags.Read
+        request.Write = flags.Write
+        request.Append = flags.Append
+        request.Create = flags.Creat
+        request.Truncate = flags.Trunc
+        request.Exclusive = flags.Excl
+        if raw.Method == "Setstat" {
+            attrs := raw.AttrFlags()
+            request.HasSize = attrs.Size
+            request.HasUidGid = attrs.UidGid
+            request.HasPermissions = attrs.Permissions
+            request.HasModifiedTime = attrs.Acmodtime
+            request.HasAccessTime = attrs.Acmodtime
+            if attrs.Size || attrs.UidGid || attrs.Permissions || attrs.Acmodtime || len(raw.Attrs) > 0 {
+                values := raw.Attributes()
+                if values != nil {
+                    request.Size = int(values.Size)
+                    request.Uid = int(values.UID)
+                    request.Gid = int(values.GID)
+                    request.Permissions = int(values.Mode)
+                    request.ModifiedUnix = int(values.Mtime)
+                    request.AccessedUnix = int(values.Atime)
+                    request.HasExtended = len(values.Extended) > 0
+                    request.Extended = make([]*SftpExtended, 0, len(values.Extended))
+                    for _, item := range values.Extended {
+                        request.Extended = append(request.Extended, NewSftpExtended(item.ExtType, item.ExtData))
+                    }
+                }
+            }
+        }
+        return request
+    }
+
+    func (backend *lamSftpBackend) read(request *SftpRequest) (result *Result) {
+        defer func() {
+            if recovered := recover(); recovered != nil {
+                result = lamSftpFailure("SftpCallbackError", fmt.Sprintf("read callback panicked: %v", recovered))
+            }
+        }()
+        return backend.handlers.DispatchRead(request)
+    }
+
+    func (backend *lamSftpBackend) write(request *SftpRequest, data []byte) (result *Result) {
+        defer func() {
+            if recovered := recover(); recovered != nil {
+                result = lamSftpFailure("SftpCallbackError", fmt.Sprintf("write callback panicked: %v", recovered))
+            }
+        }()
+        values := make([]int, len(data))
+        for index, value := range data {
+            values[index] = int(value)
+        }
+        result = backend.handlers.DispatchWrite(request, values)
+        if result != nil && result.Ok() {
+            backend.handlers.Metrics.BytesWritten.Add(len(data))
+        }
+        return result
+    }
+
+    func (backend *lamSftpBackend) list(request *SftpRequest) (result *Result) {
+        defer func() {
+            if recovered := recover(); recovered != nil {
+                result = lamSftpFailure("SftpCallbackError", fmt.Sprintf("list callback panicked: %v", recovered))
+            }
+        }()
+        return backend.handlers.DispatchList(request)
+    }
+
+    func (backend *lamSftpBackend) command(request *SftpRequest) (result *Result) {
+        defer func() {
+            if recovered := recover(); recovered != nil {
+                result = lamSftpFailure("SftpCallbackError", fmt.Sprintf("command callback panicked: %v", recovered))
+            }
+        }()
+        return backend.handlers.DispatchCommand(request)
+    }
+
+    func lamSftpBytes(result *Result, maxBytes int) ([]byte, error) {
+        if err := lamSftpResultError(result); err != nil {
+            return nil, err
+        }
+        var values []int
+        switch raw := result.Value.(type) {
+        case []int:
+            values = raw
+        case []interface{}:
+            values = make([]int, len(raw))
+            for index, item := range raw {
+                value, ok := item.(int)
+                if !ok {
+                    return nil, errors.New("read callback list contains a non-int value")
+                }
+                values[index] = value
+            }
+        default:
+            return nil, errors.New("read callback must return Result[list[int]]")
+        }
+        if maxBytes > 0 && len(values) > maxBytes {
+            return nil, fmt.Errorf("read exceeds maxReadBytes (%d)", maxBytes)
+        }
+        data := make([]byte, len(values))
+        for index, value := range values {
+            if value < 0 || value > 255 {
+                return nil, fmt.Errorf("read callback byte at index %d is outside 0..255", index)
+            }
+            data[index] = byte(value)
+        }
+        return data, nil
+    }
+
+    func lamSftpString(result *Result) (string, error) {
+        if err := lamSftpResultError(result); err != nil {
+            return "", err
+        }
+        value, ok := result.Value.(string)
+        if !ok {
+            return "", errors.New("callback must return Result[str]")
+        }
+        return value, nil
+    }
+
+    func (backend *lamSftpBackend) Fileread(raw *pkgsftp.Request) (io.ReaderAt, error) {
+        request := lamSftpRequest(raw, backend)
+        if backend.handlers.HasReadAt {
+            return &lamSftpStreamingHandle{backend: backend, request: request, readable: true}, nil
+        }
+        result := backend.read(request)
+        data, err := lamSftpBytes(result, backend.maxRead)
+        if err != nil {
+            return nil, err
+        }
+        backend.handlers.Metrics.BytesRead.Add(len(data))
+        return bytes.NewReader(data), nil
+    }
+
+    func (backend *lamSftpBackend) Filewrite(raw *pkgsftp.Request) (io.WriterAt, error) {
+        request := lamSftpRequest(raw, backend)
+        if backend.handlers.HasWriteAt {
+            return &lamSftpStreamingHandle{backend: backend, request: request, writable: true}, nil
+        }
+        return &lamSftpWriteBuffer{
+            backend:  backend,
+            request:  request,
+            maxBytes: backend.maxWrite,
+            dirty:    true,
+        }, nil
+    }
+
+    func (backend *lamSftpBackend) OpenFile(raw *pkgsftp.Request) (pkgsftp.WriterAtReaderAt, error) {
+        request := lamSftpRequest(raw, backend)
+        if backend.handlers.HasReadAt && backend.handlers.HasWriteAt {
+            return &lamSftpStreamingHandle{backend: backend, request: request, readable: true, writable: true}, nil
+        }
+        if backend.handlers.HasReadAt != backend.handlers.HasWriteAt {
+            return nil, fmt.Errorf("%w: read-write Open requires both readAt and writeAt callbacks", pkgsftp.ErrSSHFxOpUnsupported)
+        }
+        var data []byte
+        created := false
+        flags := raw.Pflags()
+        if !flags.Trunc {
+            loaded, err := lamSftpBytes(backend.read(request), backend.maxRead)
+            if err != nil {
+                notFound := errors.Is(err, pkgsftp.ErrSSHFxNoSuchFile) || errors.Is(err, os.ErrNotExist)
+                if !(flags.Creat && notFound) {
+                    return nil, err
+                }
+                created = true
+            } else {
+                data = loaded
+            }
+        }
+        if backend.maxWrite > 0 && len(data) > backend.maxWrite {
+            return nil, fmt.Errorf("existing file exceeds maxWriteBytes (%d)", backend.maxWrite)
+        }
+        return &lamSftpWriteBuffer{
+            backend:  backend,
+            request:  request,
+            data:     data,
+            maxBytes: backend.maxWrite,
+            dirty:    flags.Trunc || created,
+        }, nil
+    }
+
+    func (backend *lamSftpBackend) Filecmd(raw *pkgsftp.Request) error {
+        request := lamSftpRequest(raw, backend)
+        return lamSftpResultError(backend.command(request))
+    }
+
+    func (backend *lamSftpBackend) PosixRename(raw *pkgsftp.Request) error {
+        request := lamSftpRequest(raw, backend)
+        request.Method = "PosixRename"
+        return lamSftpResultError(backend.command(request))
+    }
+
+    func (backend *lamSftpBackend) StatVFS(raw *pkgsftp.Request) (stat *pkgsftp.StatVFS, err error) {
+        defer func() {
+            if recovered := recover(); recovered != nil {
+                stat = nil
+                err = fmt.Errorf("StatVFS callback panicked: %v", recovered)
+            }
+        }()
+        request := lamSftpRequest(raw, backend)
+        request.Method = "StatVFS"
+        result := backend.handlers.DispatchStatVFS(request)
+        if err := lamSftpResultError(result); err != nil {
+            return nil, err
+        }
+        value, ok := result.Value.(*SftpStatVFS)
+        if !ok || value == nil {
+            return nil, errors.New("StatVFS callback must return Result[SftpStatVFS]")
+        }
+        if err := lamSftpResultError(value.Validate()); err != nil {
+            return nil, err
+        }
+        return &pkgsftp.StatVFS{
+            Bsize: uint64(value.BlockSize), Frsize: uint64(value.FragmentSize),
+            Blocks: uint64(value.Blocks), Bfree: uint64(value.BlocksFree), Bavail: uint64(value.BlocksAvailable),
+            Files: uint64(value.Files), Ffree: uint64(value.FilesFree), Favail: uint64(value.FilesAvailable),
+            Fsid: uint64(value.FilesystemId), Flag: uint64(value.Flags), Namemax: uint64(value.NameMax),
+        }, nil
+    }
+
+    func lamSftpFiles(result *Result) ([]*SftpFile, error) {
+        if err := lamSftpResultError(result); err != nil {
+            return nil, err
+        }
+        switch raw := result.Value.(type) {
+        case []*SftpFile:
+            return raw, nil
+        case []interface{}:
+            files := make([]*SftpFile, len(raw))
+            for index, item := range raw {
+                file, ok := item.(*SftpFile)
+                if !ok || file == nil {
+                    return nil, errors.New("list callback contains a non-SftpFile value")
+                }
+                files[index] = file
+            }
+            return files, nil
+        default:
+            return nil, errors.New("list callback must return Result[list[SftpFile]]")
+        }
+    }
+
+    func (backend *lamSftpBackend) Filelist(raw *pkgsftp.Request) (pkgsftp.ListerAt, error) {
+        request := lamSftpRequest(raw, backend)
+        result := backend.list(request)
+        files, err := lamSftpFiles(result)
+        if err != nil {
+            return nil, err
+        }
+        items := make(lamSftpLister, 0, len(files))
+        for _, file := range files {
+            if file == nil {
+                return nil, errors.New("list callback returned an empty SftpFile")
+            }
+            if err := lamSftpResultError(file.Validate()); err != nil {
+                return nil, err
+            }
+            items = append(items, lamSftpFileInfo{file: file})
+        }
+        return items, nil
+    }
+
+    func (backend *lamSftpBackend) Lstat(raw *pkgsftp.Request) (pkgsftp.ListerAt, error) {
+        return backend.Filelist(raw)
+    }
+
+    func (backend *lamSftpBackend) RealPath(target string) (value string, err error) {
+        defer func() {
+            if recovered := recover(); recovered != nil {
+                value = ""
+                err = fmt.Errorf("RealPath callback panicked: %v", recovered)
+            }
+        }()
+        if !backend.handlers.HasRealPath {
+            if path.IsAbs(target) {
+                return path.Clean(target), nil
+            }
+            return path.Clean(path.Join(backend.startDir, target)), nil
+        }
+        raw := pkgsftp.NewRequest("RealPath", target)
+        request := lamSftpRequest(raw, backend)
+        value, err = lamSftpString(backend.handlers.DispatchRealPath(request))
+        if err != nil {
+            return "", err
+        }
+        if !path.IsAbs(value) {
+            return "", errors.New("RealPath callback must return an absolute POSIX path")
+        }
+        return path.Clean(value), nil
+    }
+
+    func (backend *lamSftpBackend) Readlink(target string) (value string, err error) {
+        defer func() {
+            if recovered := recover(); recovered != nil {
+                value = ""
+                err = fmt.Errorf("Readlink callback panicked: %v", recovered)
+            }
+        }()
+        raw := pkgsftp.NewRequest("Readlink", target)
+        request := lamSftpRequest(raw, backend)
+        if backend.handlers.HasReadlink {
+            return lamSftpString(backend.handlers.DispatchReadlink(request))
+        }
+        result := backend.list(request)
+        files, err := lamSftpFiles(result)
+        if err != nil {
+            return "", err
+        }
+        if len(files) == 0 || files[0] == nil || files[0].Target == "" {
+            return "", errors.New("Readlink must return a SftpFile with target set")
+        }
+        return files[0].Target, nil
+    }
+
+    func (backend *lamSftpBackend) LookupUserName(uid string) (name string) {
+        defer func() { _ = recover() }()
+        return backend.handlers.UsernameCallback(uid)
+    }
+
+    func (backend *lamSftpBackend) LookupGroupName(gid string) (name string) {
+        defer func() { _ = recover() }()
+        return backend.handlers.GroupCallback(gid)
+    }
+
+    func lamSftpPermissions(auth *SftpAuth) *ssh.Permissions {
+        extensions := make(map[string]string, len(auth.Meta))
+        for key, value := range auth.Meta {
+            extensions[key] = value
+        }
+        return &ssh.Permissions{Extensions: extensions}
+    }
+
+    func lamSftpAuthCall(server *SftpServer, auth *SftpAuth, callback interface{}) (accepted bool) {
+        defer func() {
+            if recover() != nil {
+                accepted = false
+                server.Metrics.AuthFailed.Increment()
+            }
+        }()
+        if !server.AllowAuthAttempt() {
+            server.Metrics.AuthFailed.Increment()
+            return false
+        }
+        handler, ok := callback.(func(*SftpAuth) bool)
+        accepted = ok && handler(auth)
+        if accepted {
+            server.Metrics.AuthSucceeded.Increment()
+        } else {
+            server.Metrics.AuthFailed.Increment()
+        }
+        return accepted
+    }
+
+    func lamSftpServeChannels(connection *ssh.ServerConn, channels <-chan ssh.NewChannel, server *SftpServer) {
+        for channelRequest := range channels {
+            if channelRequest.ChannelType() != "session" {
+                _ = channelRequest.Reject(ssh.UnknownChannelType, "session channel required")
+                continue
+            }
+            channel, requests, err := channelRequest.Accept()
+            if err != nil {
+                continue
+            }
+            go func() {
+                defer func() { _ = recover() }()
+                defer channel.Close()
+                for request := range requests {
+                    accepted := false
+                    if request.Type == "subsystem" {
+                        var payload struct{ Name string }
+                        if ssh.Unmarshal(request.Payload, &payload) == nil && payload.Name == "sftp" {
+                            accepted = true
+                        }
+                    }
+                    if request.WantReply {
+                        _ = request.Reply(accepted, nil)
+                    }
+                    if !accepted {
+                        continue
+                    }
+                    session := map[string]string{}
+                    if connection.Permissions != nil {
+                        for key, value := range connection.Permissions.Extensions {
+                            session[key] = value
+                        }
+                    }
+                    backend := &lamSftpBackend{
+                        handlers: server.Handlers,
+                        user:     connection.User(),
+                        remote:   connection.RemoteAddr().String(),
+                        session:  session,
+                        startDir: server.Config.StartDirectory,
+                        maxRead:  server.Config.MaxReadBytes,
+                        maxWrite: server.Config.MaxWriteBytes,
+                    }
+                    requestServer := pkgsftp.NewRequestServer(
+                        channel,
+                        pkgsftp.Handlers{
+                            FileGet:  backend,
+                            FilePut:  backend,
+                            FileCmd:  backend,
+                            FileList: backend,
+                        },
+                        pkgsftp.WithStartDirectory(server.Config.StartDirectory),
+                        pkgsftp.WithRSMaxTxPacket(uint32(server.Config.MaxPacketBytes)),
+                    )
+                    _ = requestServer.Serve()
+                    return
+                }
+            }()
+        }
+    }
+
+    func lamSftpServeConnection(raw net.Conn, server *SftpServer, runtime *lamSftpRuntime, sshConfig *ssh.ServerConfig) {
+        defer func() { _ = recover() }()
+        defer runtime.remove(raw)
+        defer raw.Close()
+        if deadlineConn, ok := raw.(*lamSftpDeadlineConn); ok {
+            _ = deadlineConn.Conn.SetDeadline(time.Now().Add(time.Duration(server.Config.HandshakeTimeoutMs) * time.Millisecond))
+        } else {
+            _ = raw.SetDeadline(time.Now().Add(time.Duration(server.Config.HandshakeTimeoutMs) * time.Millisecond))
+        }
+        connection, channels, requests, err := ssh.NewServerConn(raw, sshConfig)
+        if err != nil {
+            return
+        }
+        if deadlineConn, ok := raw.(*lamSftpDeadlineConn); ok {
+            deadlineConn.setTimeout(runtime.idleTimeout)
+        } else {
+            _ = raw.SetDeadline(time.Time{})
+        }
+        defer connection.Close()
+        go ssh.DiscardRequests(requests)
+        lamSftpServeChannels(connection, channels, server)
+    }
+}
+
+func sftpAdapterLoaded() -> bool {
+    return true
+}

@@ -1,0 +1,21 @@
+# Lammergeier build artefacts
+/build/
+*.lamc-cache/
+/extlibs/
+
+# Local environment and SSH host keys
+.env
+*_host_key
+*_host_key.pub
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Python, logs, and compiled binaries
+__pycache__/
+*.py[cod]
+*.log
+*.exe

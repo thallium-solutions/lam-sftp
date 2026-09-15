@@ -1,0 +1,17 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+#
+# @lam/sftp provides a callback-driven SFTP server over github.com/pkg/sftp.
+# Storage remains application-defined and expected failures use lamerrors.Result.
+# Import with: from @lam/sftp import SftpServer, SftpConfig, SftpHandlers
+
+from .models import SftpExtended, SftpErrors, SftpAuth, SftpRequest, SftpFile, SftpStatVFS
+from .interfaces import SftpStorage, SftpProtocolStorage, SftpStreamingStorage, SftpBackend
+from .metrics import SftpMetrics
+from .handlers import SftpHandlers
+from .config import SftpConfig, SftpKey
+from .server import SftpServer
+
+func tag() -> str {
+    return "@lam/sftp@1.0.0"
+}

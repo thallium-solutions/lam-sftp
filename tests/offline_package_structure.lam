@@ -1,0 +1,93 @@
+# expect: @lam/sftp@1.0.0
+# expect: true
+# expect: true
+
+# Import every public symbol through the scoped package root. This intentionally
+# does not import @lam/sftp.models: scoped nested imports are not grammar-supported.
+from @lam/sftp import SftpAuth, SftpBackend as _backendApi, SftpConfig, SftpErrors, SftpExtended, SftpFile, SftpHandlers, SftpKey, SftpMetrics, SftpProtocolStorage as _protocolApi, SftpRequest, SftpServer, SftpStatVFS, SftpStorage as _storageApi, SftpStreamingStorage as _streamingApi, tag
+from @lam/ssh import SshKeyPair
+from lamerrors import Result
+
+func verifySshBackedHostKey() -> Result[bool] {
+    privateKeyPem: str = SftpKey.generate()?
+    pair: SshKeyPair = SshKeyPair.fromPrivateKey(privateKeyPem)?
+    if not privateKeyPem.startsWith("-----BEGIN OPENSSH PRIVATE KEY-----") or not pair.publicKey.isEd25519() {
+        return Result.Err("SftpKey.generate did not return an SSH Ed25519 host key")
+    }
+    return Result.Ok(true)
+}
+
+class CompleteBackend {
+    func read(self, _request: SftpRequest) -> Result[list[int]] {
+        return Result.Ok([])
+    }
+
+    func write(self, _request: SftpRequest, data: list[int]) -> Result[int] {
+        return Result.Ok(len(data))
+    }
+
+    func list(self, _request: SftpRequest) -> Result[list[SftpFile]] {
+        return Result.Ok([])
+    }
+
+    func command(self, _request: SftpRequest) -> Result[bool] {
+        return Result.Ok(true)
+    }
+
+    func readAt(self, _request: SftpRequest, _offset: int, _length: int) -> Result[list[int]] {
+        return Result.Ok([])
+    }
+
+    func writeAt(self, _request: SftpRequest, data: list[int], _offset: int) -> Result[int] {
+        return Result.Ok(len(data))
+    }
+
+    func closeRead(self, _request: SftpRequest) -> Result[bool] {
+        return Result.Ok(true)
+    }
+
+    func closeWrite(self, _request: SftpRequest) -> Result[bool] {
+        return Result.Ok(true)
+    }
+
+    func statVFS(self, _request: SftpRequest) -> Result[SftpStatVFS] {
+        return Result.Ok(SftpStatVFS())
+    }
+
+    func realPath(self, path: str) -> Result[str] {
+        return Result.Ok(path)
+    }
+
+    func readlink(self, path: str) -> Result[str] {
+        return Result.Ok(path)
+    }
+
+    func lookupUsername(self, uid: str) -> str {
+        return uid
+    }
+
+    func lookupGroupName(self, gid: str) -> str {
+        return gid
+    }
+}
+
+func main() {
+    print(tag())
+
+    extended: SftpExtended = SftpExtended("vendor", "value")
+    auth: SftpAuth = SftpAuth().set("extended", extended.data)
+    request: SftpRequest = SftpRequest()
+    file: SftpFile = SftpFile.file("root.txt")
+    stat: SftpStatVFS = SftpStatVFS()
+    metrics: SftpMetrics = SftpMetrics()
+    handlers: SftpHandlers = SftpHandlers().useBackend(CompleteBackend())
+    handlers.metrics = metrics
+    print(auth.value("extended") == "value" and file.validate().ok() and stat.validate().ok() and not SftpErrors.eof().ok() and handlers.dispatchRead(request).ok())
+
+    generated: Result[bool] = verifySshBackedHostKey()
+    config: SftpConfig = SftpConfig("private-key")
+    server: SftpServer = SftpServer(config, handlers)
+    # These methods reference runtime types supplied only by the transitively
+    # imported adapter module, proving root-only consumers bundle internals.
+    print(generated.ok() and not server.isListening() and server.activeConnections() == 0)
+}

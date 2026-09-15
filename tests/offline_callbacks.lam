@@ -1,0 +1,35 @@
+# expect: callbacks-ready
+# expect: true
+# expect: false
+# expect: true
+
+from @lam/sftp import SftpAuth, SftpConfig, SftpFile, SftpHandlers, SftpRequest, SftpServer
+from lamerrors import Result
+from lambytes import Bytes
+
+func readGreeting(request: SftpRequest) -> Result[list[int]] {
+    if request.path == "/greeting.txt" {
+        return Result.Ok(Bytes.toBytes("hello"))
+    }
+    return Result.Err("missing")
+}
+
+func main() {
+    handlers: SftpHandlers = SftpHandlers(
+    read = readGreeting,
+    write = lambda(request: SftpRequest, data: list[int]) -> Result[int]: Result.Ok(len(data)),
+    list = lambda(request: SftpRequest) -> Result[list[SftpFile]]: Result.Ok([SftpFile.file("greeting.txt", 5)]),
+    command = lambda(request: SftpRequest) -> Result[bool]: Result.Ok(true),
+    )
+
+    server: SftpServer = SftpServer(SftpConfig("private-key"), handlers)
+    _ = server.onPasswordAuth(lambda(auth: SftpAuth) -> bool: auth.username == "demo" and auth.password == "secret")
+    print("callbacks-ready")
+    print(server.handlers.readCallback != None)
+    print(server.isListening())
+
+    auth: SftpAuth = SftpAuth()
+    auth.username = "demo"
+    auth.password = "secret"
+    print(auth.username == "demo" and auth.password == "secret")
+}

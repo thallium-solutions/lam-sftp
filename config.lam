@@ -1,0 +1,169 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamerrors import Result, Error
+from lamos import Os
+from @lam/ssh import SshKeyPair
+
+class SftpConfig {
+    func __init__(self, hostKey: str = "", address: str = "127.0.0.1:2022", startDirectory: str = "/", maxReadBytes: int = 67108864, maxWriteBytes: int = 67108864, maxPacketBytes: int = 32768, maxConnections: int = 256, handshakeTimeoutMs: int = 10000, idleTimeoutMs: int = 300000, maxAuthTries: int = 6, authAttemptsPerSecond: int = 20, authBurst: int = 40) {
+        self.hostKey: str = hostKey
+        self.hostKeys: list[str] = []
+        if hostKey != "" {
+            self.hostKeys.append(hostKey)
+        }
+        self.hostKeyPassphrase: str = ""
+        self.address: str = address
+        self.startDirectory: str = startDirectory
+        self.maxReadBytes: int = maxReadBytes
+        self.maxWriteBytes: int = maxWriteBytes
+        self.maxPacketBytes: int = maxPacketBytes
+        self.maxConnections: int = maxConnections
+        self.handshakeTimeoutMs: int = handshakeTimeoutMs
+        self.idleTimeoutMs: int = idleTimeoutMs
+        self.maxAuthTries: int = maxAuthTries
+        self.authAttemptsPerSecond: int = authAttemptsPerSecond
+        self.authBurst: int = authBurst
+        self.serverVersion: str = "SSH-2.0-lam-sftp"
+        self.production: bool = false
+    }
+
+    static func fromKeyFile(path: str, address: str = "127.0.0.1:2022", startDirectory: str = "/", maxReadBytes: int = 67108864, maxWriteBytes: int = 67108864, maxPacketBytes: int = 32768) -> Result[SftpConfig] {
+        loaded: Result = Os.tryReadFile(path)
+        if not loaded.ok() {
+            return loaded
+        }
+        hostKey: str = ""
+        go! {
+            hostKey = loaded.Value.(string)
+        }
+        return Result.Ok(SftpConfig(hostKey, address, startDirectory, maxReadBytes, maxWriteBytes, maxPacketBytes))
+    }
+
+    func validate(self) -> Result[bool] {
+        if len(self.hostKeys) == 0 {
+            return Result.Err(Error("SftpConfigError", "at least one host key is required", None))
+        }
+        if self.address == "" {
+            return Result.Err(Error("SftpConfigError", "address is required", None))
+        }
+        if self.startDirectory == "" or not self.startDirectory.startsWith("/") {
+            return Result.Err(Error("SftpConfigError", "startDirectory must be an absolute POSIX path", None))
+        }
+        if self.maxReadBytes < 0 {
+            return Result.Err(Error("SftpConfigError", "maxReadBytes cannot be negative", None))
+        }
+        if self.maxWriteBytes < 0 {
+            return Result.Err(Error("SftpConfigError", "maxWriteBytes cannot be negative", None))
+        }
+        if self.maxPacketBytes < 32768 or self.maxPacketBytes > 16777216 {
+            return Result.Err(Error("SftpConfigError", "maxPacketBytes must be between 32768 and 16777216", None))
+        }
+        if self.maxConnections < 1 {
+            return Result.Err(Error("SftpConfigError", "maxConnections must be at least 1", None))
+        }
+        if self.handshakeTimeoutMs < 1 or self.idleTimeoutMs < 0 {
+            return Result.Err(Error("SftpConfigError", "handshakeTimeoutMs must be positive and idleTimeoutMs cannot be negative", None))
+        }
+        if self.maxAuthTries < 1 {
+            return Result.Err(Error("SftpConfigError", "maxAuthTries must be at least 1", None))
+        }
+        if self.authAttemptsPerSecond < 0 or self.authBurst < 1 {
+            return Result.Err(Error("SftpConfigError", "authAttemptsPerSecond cannot be negative and authBurst must be positive", None))
+        }
+        if not self.serverVersion.startsWith("SSH-2.0-") {
+            return Result.Err(Error("SftpConfigError", "serverVersion must start with SSH-2.0-", None))
+        }
+        return Result.Ok(true)
+    }
+
+    func withAddress(self, address: str) -> SftpConfig {
+        self.address = address
+        return self
+    }
+
+    func withStartDirectory(self, path: str) -> SftpConfig {
+        self.startDirectory = path
+        return self
+    }
+
+    func withReadLimit(self, maxBytes: int) -> SftpConfig {
+        self.maxReadBytes = maxBytes
+        return self
+    }
+
+    func withWriteLimit(self, maxBytes: int) -> SftpConfig {
+        self.maxWriteBytes = maxBytes
+        return self
+    }
+
+    func withPacketSize(self, maxBytes: int) -> SftpConfig {
+        self.maxPacketBytes = maxBytes
+        return self
+    }
+
+    func addHostKey(self, key: str) -> SftpConfig {
+        if key != "" {
+            self.hostKeys.append(key)
+            if self.hostKey == "" {
+                self.hostKey = key
+            }
+        }
+        return self
+    }
+
+    func addHostKeyFile(self, path: str) -> Result[SftpConfig] {
+        loaded: Result = Os.tryReadFile(path)
+        if not loaded.ok() {
+            return loaded
+        }
+        key: str = ""
+        go! {
+            key = loaded.Value.(string)
+        }
+        return Result.Ok(self.addHostKey(key))
+    }
+
+    func withHostKeyPassphrase(self, passphrase: str) -> SftpConfig {
+        self.hostKeyPassphrase = passphrase
+        return self
+    }
+
+    func withConnectionLimit(self, maxConnections: int) -> SftpConfig {
+        self.maxConnections = maxConnections
+        return self
+    }
+
+    func withTimeouts(self, handshakeMs: int, idleMs: int) -> SftpConfig {
+        self.handshakeTimeoutMs = handshakeMs
+        self.idleTimeoutMs = idleMs
+        return self
+    }
+
+    func withAuthRateLimit(self, attemptsPerSecond: int, burst: int) -> SftpConfig {
+        self.authAttemptsPerSecond = attemptsPerSecond
+        self.authBurst = burst
+        return self
+    }
+
+    func withServerVersion(self, version: str) -> SftpConfig {
+        self.serverVersion = version
+        return self
+    }
+
+    func productionMode(self, enabled: bool = true) -> SftpConfig {
+        self.production = enabled
+        return self
+    }
+}
+
+class SftpKey {
+    static func generate() -> Result[str] {
+        pair: SshKeyPair = SshKeyPair.generateHostEd25519("lam-sftp host key", "")?
+        return Result.Ok(pair.privateKeyPem)
+    }
+
+    static func readFile(path: str) -> Result[str] {
+        return Os.tryReadFile(path)
+    }
+}

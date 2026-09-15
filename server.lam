@@ -1,0 +1,538 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamconcurrency import RWMutex
+from lamerrors import Result, Error
+from lamlog import Log
+from lamratelimit import TokenBucket
+from lamtime import Time
+from .models import SftpAuth, SftpFile, SftpRequest, SftpStatVFS
+from .metrics import SftpMetrics
+from .handlers import SftpHandlers
+from .config import SftpConfig
+from ._adapter import sftpAdapterLoaded
+
+go! {
+    import (
+        "errors"
+        "fmt"
+        "net"
+        "strings"
+        "time"
+
+        "golang.org/x/crypto/ssh"
+    )
+}
+
+class SftpServer {
+    func __init__(self, config: SftpConfig, handlers: SftpHandlers = SftpHandlers()) {
+        _ = sftpAdapterLoaded()
+        self.config: SftpConfig = config
+        self.handlers: SftpHandlers = handlers
+        self.metrics: SftpMetrics = None
+        burst: int = config.authBurst
+        rate: int = config.authAttemptsPerSecond
+        if burst < 1 {
+            burst = 1
+        }
+        if rate < 1 {
+            rate = 1
+        }
+        self.authLimiter: TokenBucket = TokenBucket(burst, rate)
+        self.startedUnix: int = 0
+        self.passwordAuth: func(SftpAuth) -> bool = lambda(_auth: SftpAuth) -> bool: false
+        self.publicKeyAuth: func(SftpAuth) -> bool = lambda(_auth: SftpAuth) -> bool: false
+        self.hasPasswordAuth: bool = false
+        self.hasPublicKeyAuth: bool = false
+        self.readyCallbacks: list[func(SftpServer)] = []
+        self.listenCallbacks: list[func(SftpServer)] = []
+        self.closeCallbacks: list[func(SftpServer)] = []
+        self.errorCallbacks: list[func(any)] = []
+        self.boundAddress: str = ""
+        self._raw: any = None
+        self._stateMu: RWMutex = RWMutex()
+        self._serveTask: any = None
+        go! {
+            s.Metrics = handlers.Metrics
+        }
+    }
+
+    func allowAuthAttempt(self) -> bool {
+        if self.config.authAttemptsPerSecond == 0 {
+            return true
+        }
+        return self.authLimiter.tryTake(1)
+    }
+
+    func uptimeSeconds(self) -> int {
+        if self.startedUnix == 0 {
+            return 0
+        }
+        return Time.nowUnix() - self.startedUnix
+    }
+
+    func metricsSnapshot(self) -> dict[str, int] {
+        return self.metrics.snapshot()
+    }
+
+    func onPasswordAuth(self, callback: func(SftpAuth) -> bool) -> SftpServer {
+        self.passwordAuth = callback
+        self.hasPasswordAuth = true
+        return self
+    }
+
+    func onPublicKeyAuth(self, callback: func(SftpAuth) -> bool) -> SftpServer {
+        self.publicKeyAuth = callback
+        self.hasPublicKeyAuth = true
+        return self
+    }
+
+    func onRead(self, callback: func(SftpRequest) -> Result[list[int]]) -> SftpServer {
+        self.handlers.onRead(callback)
+        return self
+    }
+
+    func onWrite(self, callback: func(SftpRequest, list[int]) -> Result[int]) -> SftpServer {
+        self.handlers.onWrite(callback)
+        return self
+    }
+
+    func onReadAt(self, callback: func(SftpRequest, int, int) -> Result[list[int]]) -> SftpServer {
+        self.handlers.onReadAt(callback)
+        return self
+    }
+
+    func onWriteAt(self, callback: func(SftpRequest, list[int], int) -> Result[int]) -> SftpServer {
+        self.handlers.onWriteAt(callback)
+        return self
+    }
+
+    func onCloseRead(self, callback: func(SftpRequest) -> Result[bool]) -> SftpServer {
+        self.handlers.onCloseRead(callback)
+        return self
+    }
+
+    func onCloseWrite(self, callback: func(SftpRequest) -> Result[bool]) -> SftpServer {
+        self.handlers.onCloseWrite(callback)
+        return self
+    }
+
+    func onTransferError(self, callback: func(SftpRequest, any)) -> SftpServer {
+        self.handlers.onTransferError(callback)
+        return self
+    }
+
+    func onList(self, callback: func(SftpRequest) -> Result[list[SftpFile]]) -> SftpServer {
+        self.handlers.onList(callback)
+        return self
+    }
+
+    func onCommand(self, callback: func(SftpRequest) -> Result[bool]) -> SftpServer {
+        self.handlers.onCommand(callback)
+        return self
+    }
+
+    func onStatVFS(self, callback: func(SftpRequest) -> Result[SftpStatVFS]) -> SftpServer {
+        self.handlers.onStatVFS(callback)
+        return self
+    }
+
+    func onRealPath(self, callback: func(str) -> Result[str]) -> SftpServer {
+        self.handlers.onRealPath(callback)
+        return self
+    }
+
+    func onReadlink(self, callback: func(str) -> Result[str]) -> SftpServer {
+        self.handlers.onReadlink(callback)
+        return self
+    }
+
+    func onUsername(self, callback: func(str) -> str) -> SftpServer {
+        self.handlers.onUsername(callback)
+        return self
+    }
+
+    func onGroupName(self, callback: func(str) -> str) -> SftpServer {
+        self.handlers.onGroupName(callback)
+        return self
+    }
+
+    func onCommandMethod(self, method: str, callback: func(SftpRequest) -> Result[bool]) -> SftpServer {
+        self.handlers.onCommandMethod(method, callback)
+        return self
+    }
+
+    func onMkdir(self, callback: func(SftpRequest) -> Result[bool]) -> SftpServer {
+        self.handlers.onMkdir(callback)
+        return self
+    }
+
+    func onRemove(self, callback: func(SftpRequest) -> Result[bool]) -> SftpServer {
+        self.handlers.onRemove(callback)
+        return self
+    }
+
+    func onRename(self, callback: func(SftpRequest) -> Result[bool]) -> SftpServer {
+        self.handlers.onRename(callback)
+        return self
+    }
+
+    func onSetstat(self, callback: func(SftpRequest) -> Result[bool]) -> SftpServer {
+        self.handlers.onSetstat(callback)
+        return self
+    }
+
+    func onRmdir(self, callback: func(SftpRequest) -> Result[bool]) -> SftpServer {
+        self.handlers.onRmdir(callback)
+        return self
+    }
+
+    func onLink(self, callback: func(SftpRequest) -> Result[bool]) -> SftpServer {
+        self.handlers.onLink(callback)
+        return self
+    }
+
+    func onSymlink(self, callback: func(SftpRequest) -> Result[bool]) -> SftpServer {
+        self.handlers.onSymlink(callback)
+        return self
+    }
+
+    func onPosixRename(self, callback: func(SftpRequest) -> Result[bool]) -> SftpServer {
+        self.handlers.onPosixRename(callback)
+        return self
+    }
+
+    func guard(self, callback: func(SftpRequest) -> Result[bool]) -> SftpServer {
+        self.handlers.guard(callback)
+        return self
+    }
+
+    func onRequest(self, callback: func(SftpRequest)) -> SftpServer {
+        self.handlers.onRequest(callback)
+        return self
+    }
+
+    func onResult(self, callback: func(SftpRequest, Result)) -> SftpServer {
+        self.handlers.onResult(callback)
+        return self
+    }
+
+    func setReadOnly(self, enabled: bool = true) -> SftpServer {
+        self.handlers.setReadOnly(enabled)
+        return self
+    }
+
+    func useStorage(self, storage: any) -> SftpServer {
+        self.handlers.useStorage(storage)
+        return self
+    }
+
+    func useBackend(self, storage: any) -> SftpServer {
+        self.handlers.useBackend(storage)
+        return self
+    }
+
+    func useStreamingStorage(self, storage: any) -> SftpServer {
+        self.handlers.useStreamingStorage(storage)
+        return self
+    }
+
+    func useProtocolStorage(self, storage: any) -> SftpServer {
+        self.handlers.useProtocolStorage(storage)
+        return self
+    }
+
+    func onReady(self, callback: func(SftpServer)) -> SftpServer {
+        self.readyCallbacks.append(callback)
+        return self
+    }
+
+    func onListen(self, callback: func(SftpServer)) -> SftpServer {
+        self.listenCallbacks.append(callback)
+        return self
+    }
+
+    func onClose(self, callback: func(SftpServer)) -> SftpServer {
+        self.closeCallbacks.append(callback)
+        return self
+    }
+
+    func onError(self, callback: func(any)) -> SftpServer {
+        self.errorCallbacks.append(callback)
+        return self
+    }
+
+    func _runLifecycle(self, callbacks: list[func(SftpServer)]) {
+        for callback in callbacks {
+            try {
+                callback(self)
+            } catch error {
+                self._notifyError(error)
+            }
+        }
+    }
+
+    func _notifyError(self, error: any) {
+        if len(self.errorCallbacks) == 0 {
+            Log.error(f"@lam/sftp: {error}")
+            return
+        }
+        for callback in self.errorCallbacks {
+            try {
+                callback(error)
+            } catch ignored {
+                _ = ignored
+            }
+        }
+    }
+
+    func _validateStart(self) -> Result[bool] {
+        configured: Result = self.config.validate()
+        if not configured.ok() {
+            return configured
+        }
+        if not self.hasPasswordAuth and not self.hasPublicKeyAuth {
+            return Result.Err(Error("SftpConfigError", "at least one authentication callback is required", None))
+        }
+        if self.config.production {
+            if not self.handlers.hasStatVFS or not self.handlers.hasRealPath or not self.handlers.hasReadlink {
+                return Result.Err(Error("SftpConfigError", "production mode requires StatVFS, RealPath, and Readlink callbacks", None))
+            }
+            if self.config.maxReadBytes == 0 or self.config.maxWriteBytes == 0 or self.config.idleTimeoutMs == 0 or self.config.authAttemptsPerSecond == 0 {
+                return Result.Err(Error("SftpConfigError", "production mode requires bounded reads, writes, idle time, and authentication rate", None))
+            }
+        }
+        return Result.Ok(true)
+    }
+
+    func _start(self) -> Result {
+        self._stateMu.lock()
+        defer self._stateMu.unlock()
+        go! {
+            if runtime, _ := s._raw.(*lamSftpRuntime); runtime != nil && !runtime.isClosed() {
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("SftpListenError", "server is already listening", nil))
+            }
+            validation := s.Config.Validate()
+            if err := lamSftpResultError(validation); err != nil {
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("SftpListenError", err.Error(), nil))
+            }
+            if err := lamSftpConfigureExtensions(); err != nil {
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("SftpListenError", err.Error(), nil))
+            }
+            sshConfig := &ssh.ServerConfig{ServerVersion: s.Config.ServerVersion, MaxAuthTries: s.Config.MaxAuthTries}
+            for _, keyText := range s.Config.HostKeys {
+                var signer ssh.Signer
+                var err error
+                if s.Config.HostKeyPassphrase == "" {
+                    signer, err = ssh.ParsePrivateKey([]byte(keyText))
+                } else {
+                    signer, err = ssh.ParsePrivateKeyWithPassphrase([]byte(keyText), []byte(s.Config.HostKeyPassphrase))
+                }
+                if err != nil {
+                    return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("SftpListenError", fmt.Sprintf("parse host key: %v", err), nil))
+                }
+                sshConfig.AddHostKey(signer)
+            }
+            if s.HasPasswordAuth {
+                sshConfig.PasswordCallback = func(meta ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+                    auth := NewSftpAuth()
+                    auth.Username = meta.User()
+                    auth.RemoteAddress = meta.RemoteAddr().String()
+                    auth.Method = "password"
+                    auth.Password = string(password)
+                    defer func() {
+                        auth.Password = ""
+                        for index := range password {
+                            password[index] = 0
+                        }
+                    }()
+                    if !lamSftpAuthCall(s, auth, s.PasswordAuth) {
+                        return nil, errors.New("authentication failed")
+                    }
+                    return lamSftpPermissions(auth), nil
+                }
+            }
+            if s.HasPublicKeyAuth {
+                sshConfig.PublicKeyCallback = func(meta ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+                    auth := NewSftpAuth()
+                    auth.Username = meta.User()
+                    auth.RemoteAddress = meta.RemoteAddr().String()
+                    auth.Method = "publicKey"
+                    auth.PublicKey = strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
+                    auth.Fingerprint = ssh.FingerprintSHA256(key)
+                    if !lamSftpAuthCall(s, auth, s.PublicKeyAuth) {
+                        return nil, errors.New("authentication failed")
+                    }
+                    return lamSftpPermissions(auth), nil
+                }
+            }
+            listener, err := net.Listen("tcp", s.Config.Address)
+            if err != nil {
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("SftpListenError", err.Error(), nil))
+            }
+            runtime := &lamSftpRuntime{
+                listener:       listener,
+                conns:          make(map[net.Conn]struct{}),
+                finished:       make(chan struct{}),
+                sshConfig:      sshConfig,
+                maxConnections: s.Config.MaxConnections,
+                idleTimeout:    time.Duration(s.Config.IdleTimeoutMs) * time.Millisecond,
+            }
+            s._raw = runtime
+            s.BoundAddress = listener.Addr().String()
+            return LAMMERGEIER.Result.Ok(runtime)
+        }
+    }
+
+    func _serve(self, raw: any) -> Result[bool] {
+        result: Result = Result.Ok(true)
+        go! {
+            runtime, ok := raw.(*lamSftpRuntime)
+            if !ok || runtime == nil {
+                result = LAMMERGEIER.Result.Err(LAMMERGEIER.Error("SftpServeError", "invalid server runtime", nil))
+            } else {
+                var serveErr error
+                for {
+                    connection, err := runtime.listener.Accept()
+                    if err != nil {
+                        if !runtime.isClosed() {
+                            serveErr = err
+                        }
+                        break
+                    }
+                    connection = &lamSftpDeadlineConn{Conn: connection}
+                    if !runtime.add(connection) {
+                        s.Metrics.ConnectionsRejected.Increment()
+                        _ = connection.Close()
+                        if runtime.isClosed() {
+                            break
+                        }
+                        continue
+                    }
+                    s.Metrics.ConnectionsAccepted.Increment()
+                    go lamSftpServeConnection(connection, s, runtime, runtime.sshConfig)
+                }
+                runtime.stop()
+                runtime.wg.Wait()
+                if serveErr != nil {
+                    result = LAMMERGEIER.Result.Err(LAMMERGEIER.Error("SftpServeError", serveErr.Error(), nil))
+                }
+            }
+        }
+        if not result.ok() {
+            self._notifyError(result.error)
+        }
+        self._runLifecycle(self.closeCallbacks)
+        self._stateMu.lock()
+        go! {
+            if runtime, ok := raw.(*lamSftpRuntime); ok && runtime != nil {
+                if current, _ := s._raw.(*lamSftpRuntime); current == runtime {
+                    s._raw = nil
+                    s.BoundAddress = ""
+                }
+                close(runtime.finished)
+            }
+        }
+        self._stateMu.unlock()
+        return result
+    }
+
+    func tryListen(self) -> Result[bool] {
+        ready: Result = self._validateStart()
+        if not ready.ok() {
+            self._notifyError(ready.error)
+            return ready
+        }
+        self._runLifecycle(self.readyCallbacks)
+        started: Result = self._start()
+        if not started.ok() {
+            self._notifyError(started.error)
+            return started
+        }
+        self.startedUnix = Time.nowUnix()
+        self._runLifecycle(self.listenCallbacks)
+        return self._serve(started.value)
+    }
+
+    func listen(self) {
+        _ = self.tryListen().unwrap()
+    }
+
+    func tryListenBackground(self) -> Result[bool] {
+        ready: Result = self._validateStart()
+        if not ready.ok() {
+            self._notifyError(ready.error)
+            return ready
+        }
+        self._runLifecycle(self.readyCallbacks)
+        started: Result = self._start()
+        if not started.ok() {
+            self._notifyError(started.error)
+            return started
+        }
+        self.startedUnix = Time.nowUnix()
+        self._runLifecycle(self.listenCallbacks)
+        self._serveTask = _serveSftp(self, started.value)
+        return Result.Ok(true)
+    }
+
+    func listenBackground(self) -> bool {
+        return self.tryListenBackground().ok()
+    }
+
+    func close(self) {
+        self._stateMu.rLock()
+        raw: any = self._raw
+        self._stateMu.rUnlock()
+        go! {
+            if runtime, ok := raw.(*lamSftpRuntime); ok && runtime != nil {
+                runtime.stop()
+            }
+        }
+    }
+
+    func wait(self) {
+        self._stateMu.rLock()
+        raw: any = self._raw
+        self._stateMu.rUnlock()
+        go! {
+            if runtime, ok := raw.(*lamSftpRuntime); ok && runtime != nil {
+                <-runtime.finished
+            }
+        }
+    }
+
+    func shutdown(self) {
+        self.close()
+        self.wait()
+    }
+
+    func activeConnections(self) -> int {
+        self._stateMu.rLock()
+        raw: any = self._raw
+        self._stateMu.rUnlock()
+        go! {
+            runtime, ok := raw.(*lamSftpRuntime)
+            if !ok || runtime == nil {
+                return 0
+            }
+            runtime.mu.Lock()
+            defer runtime.mu.Unlock()
+            return len(runtime.conns)
+        }
+    }
+
+    func isListening(self) -> bool {
+        self._stateMu.rLock()
+        raw: any = self._raw
+        self._stateMu.rUnlock()
+        go! {
+            runtime, ok := raw.(*lamSftpRuntime)
+            return ok && runtime != nil && !runtime.isClosed()
+        }
+    }
+}
+
+async func _serveSftp(server: SftpServer, runtime: any) -> Result[bool] {
+    return server._serve(runtime)
+}

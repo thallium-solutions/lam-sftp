@@ -1,0 +1,405 @@
+# expect: hostkey=true
+# expect: listening=true
+# expect: connections=true
+# expect: connectionlimit=true
+# expect: greeting=hello
+# expect: context=true
+# expect: upload=payload
+# expect: entries=2
+# expect: attrs=1000:1001:1
+# expect: realpath=/canonical
+# expect: readlink=/greeting.txt
+# expect: statvfs=4096:1000
+# expect: posix=PosixRename
+# expect: link=Link
+# expect: command=Mkdir
+# expect: permission=true
+# expect: limited=true
+# expect: shortwrite=true
+# expect: rejected=true
+# expect: publickey=true
+# expect: listening=false
+# expect: lifecycle=true:true:true:0
+# expect: metrics=true
+
+from @lam/sftp import SftpAuth, SftpConfig, SftpErrors, SftpExtended, SftpFile, SftpKey, SftpRequest, SftpServer, SftpStatVFS
+from @lam/ssh import SshKeyPair
+from lambytes import Bytes
+from lamconcurrency import Mutex
+from lamerrors import Result
+
+go! {
+    import (
+        "crypto/ed25519"
+        "crypto/rand"
+        "errors"
+        "fmt"
+        "io"
+        "os"
+
+        clientsftp "github.com/pkg/sftp"
+        "golang.org/x/crypto/ssh"
+    )
+}
+
+class MemoryStorage {
+    func __init__(self) {
+        self.mu: Mutex = Mutex()
+        self.upload: list[int] = []
+        self.hasUpload: bool = false
+        self.lastCommand: str = ""
+        self.contextActive: bool = false
+    }
+
+    func read(self, request: SftpRequest) -> Result[list[int]] {
+        self.mu.lock()
+        self.contextActive = self.contextActive or(not request.context().expired() and request.deadlineUnix() == 0)
+        self.mu.unlock()
+        if request.path == "/greeting.txt" {
+            return Result.Ok(Bytes.toBytes("hello"))
+        }
+        self.mu.lock()
+        exists: bool = self.hasUpload
+        data: list[int] = self.upload
+        self.mu.unlock()
+        if request.path == "/upload.txt" and exists {
+            return Result.Ok(data)
+        }
+        return SftpErrors.notFound(request.path)
+    }
+
+    func write(self, _request: SftpRequest, data: list[int]) -> Result[int] {
+        self.mu.lock()
+        self.upload = data
+        self.hasUpload = true
+        self.mu.unlock()
+        return Result.Ok(len(data))
+    }
+
+    func list(self, request: SftpRequest) -> Result[list[SftpFile]] {
+        if request.method == "Stat" or request.method == "Lstat" {
+            if request.path == "/" {
+                return Result.Ok([SftpFile.directory("/")])
+            }
+            if request.path == "/greeting.txt" {
+                return Result.Ok([SftpFile("greeting.txt", 5, "file", 420, 0, "", "", 1000, 1001, [SftpExtended("vendor@test", "ready")])])
+            }
+            self.mu.lock()
+            exists: bool = self.hasUpload
+            size: int = len(self.upload)
+            self.mu.unlock()
+            if request.path == "/upload.txt" and exists {
+                return Result.Ok([SftpFile.file("upload.txt", size)])
+            }
+            return SftpErrors.notFound(request.path)
+        }
+        if request.method == "List" and request.path == "/" {
+            files: list[SftpFile] = [SftpFile.file("greeting.txt", 5)]
+            self.mu.lock()
+            if self.hasUpload {
+                files.append(SftpFile.file("upload.txt", len(self.upload)))
+            }
+            self.mu.unlock()
+            return Result.Ok(files)
+        }
+        return SftpErrors.notFound(request.path)
+    }
+
+    func command(self, request: SftpRequest) -> Result[bool] {
+        if request.path == "/forbidden" {
+            return SftpErrors.permissionDenied(request.path)
+        }
+        self.mu.lock()
+        self.lastCommand = request.method
+        self.mu.unlock()
+        return Result.Ok(true)
+    }
+
+    func readAt(self, request: SftpRequest, offset: int, length: int) -> Result[list[int]] {
+        data: list[int] = self.read(request)?
+        if offset >= len(data) {
+            return Result.Ok([])
+        }
+        end: int = offset + length
+        if end > len(data) {
+            end = len(data)
+        }
+        return Result.Ok(data[offset: end])
+    }
+
+    func writeAt(self, request: SftpRequest, data: list[int], offset: int) -> Result[int] {
+        if request.path == "/partial.txt" {
+            return Result.Ok(len(data) - 1)
+        }
+        end: int = offset + len(data)
+        if end > 7 {
+            return SftpErrors.invalid("stream limit")
+        }
+        self.mu.lock()
+        while len(self.upload) < end {
+            self.upload.append(0)
+        }
+        for index in range(len(data)) {
+            self.upload[offset + index] = data[index]
+        }
+        self.hasUpload = true
+        self.mu.unlock()
+        return Result.Ok(len(data))
+    }
+
+    func closeRead(self, _request: SftpRequest) -> Result[bool] {
+        return Result.Ok(true)
+    }
+
+    func closeWrite(self, _request: SftpRequest) -> Result[bool] {
+        return Result.Ok(true)
+    }
+
+    func statVFS(self, _request: SftpRequest) -> Result[SftpStatVFS] {
+        return Result.Ok(SftpStatVFS(4096, 4096, 1000, 500, 400, 100, 50, 40, 7, 0, 255))
+    }
+
+    func realPath(self, _path: str) -> Result[str] {
+        return Result.Ok("/canonical")
+    }
+
+    func readlink(self, _path: str) -> Result[str] {
+        return Result.Ok("/greeting.txt")
+    }
+
+    func lookupUsername(self, uid: str) -> str {
+        return "user-" + uid
+    }
+
+    func lookupGroupName(self, gid: str) -> str {
+        return "group-" + gid
+    }
+}
+
+class Lifecycle {
+    func __init__(self) {
+        self.ready: bool = false
+        self.listening: bool = false
+        self.closed: bool = false
+        self.errors: int = 0
+    }
+
+    func onReady(self, _server: SftpServer) {
+        self.ready = true
+    }
+
+    func onListen(self, _server: SftpServer) {
+        self.listening = true
+    }
+
+    func onClose(self, _server: SftpServer) {
+        self.closed = true
+    }
+
+    func onError(self, _error: any) {
+        self.errors += 1
+    }
+}
+
+func passwordAuth(auth: SftpAuth) -> bool {
+    return auth.username == "demo" and auth.password == "secret"
+}
+
+func publicKeyAuth(auth: SftpAuth) -> bool {
+    return auth.username == "keyuser" and auth.method == "publicKey"
+}
+
+func run() -> Result[bool] {
+    hostKey: str = SftpKey.generate()?
+    hostPair: SshKeyPair = SshKeyPair.fromPrivateKey(hostKey)?
+    print(f"hostkey={hostKey.startsWith('-----BEGIN OPENSSH PRIVATE KEY-----') and hostPair.publicKey.isEd25519()}")
+    config: SftpConfig = SftpConfig(hostKey, "127.0.0.1:0")
+    config.maxWriteBytes = 7
+    config = config.withConnectionLimit(1).productionMode()
+    storage: MemoryStorage = MemoryStorage()
+    lifecycle: Lifecycle = Lifecycle()
+    server: SftpServer = SftpServer(config)
+    server = server.useBackend(storage)
+    _ = server.onPasswordAuth(passwordAuth)
+    _ = server.onPublicKeyAuth(publicKeyAuth)
+    _ = server.onReady(lifecycle.onReady)
+    _ = server.onListen(lifecycle.onListen)
+    _ = server.onClose(lifecycle.onClose)
+    _ = server.onError(lifecycle.onError)
+    print(f"listening={server.listenBackground()}")
+
+    go! {
+        clientConfig := &ssh.ClientConfig{
+            User:            "demo",
+            Auth:            []ssh.AuthMethod{ssh.Password("secret")},
+            HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+        }
+        sshClient, err := ssh.Dial("tcp", server.BoundAddress, clientConfig)
+        if err != nil {
+            panic(err)
+        }
+        client, err := clientsftp.NewClient(sshClient)
+        if err != nil {
+            panic(err)
+        }
+        fmt.Printf("connections=%v\n", server.ActiveConnections() > 0)
+        overflowClient, overflowErr := ssh.Dial("tcp", server.BoundAddress, clientConfig)
+        if overflowErr == nil {
+            _ = overflowClient.Close()
+        }
+        fmt.Printf("connectionlimit=%v\n", overflowErr != nil)
+
+        greetingFile, err := client.Open("/greeting.txt")
+        if err != nil {
+            panic(err)
+        }
+        greeting, err := io.ReadAll(greetingFile)
+        if err != nil {
+            panic(err)
+        }
+        _ = greetingFile.Close()
+        fmt.Printf("greeting=%s\n", greeting)
+        storage.Mu.Lock()
+        fmt.Printf("context=%v\n", storage.ContextActive)
+        storage.Mu.Unlock()
+
+        file, err := client.Create("/upload.txt")
+        if err != nil {
+            panic(err)
+        }
+        if _, err = file.Write([]byte("payload")); err != nil {
+            panic(err)
+        }
+        if err = file.Close(); err != nil {
+            panic(err)
+        }
+        uploadFile, err := client.Open("/upload.txt")
+        if err != nil {
+            panic(err)
+        }
+        uploaded, err := io.ReadAll(uploadFile)
+        if err != nil {
+            panic(err)
+        }
+        _ = uploadFile.Close()
+        fmt.Printf("upload=%s\n", uploaded)
+
+        entries, err := client.ReadDir("/")
+        if err != nil && err != io.EOF {
+            panic(err)
+        }
+        fmt.Printf("entries=%d\n", len(entries))
+
+        info, err := client.Stat("/greeting.txt")
+        if err != nil {
+            panic(err)
+        }
+        attrs, ok := info.Sys().(*clientsftp.FileStat)
+        if !ok {
+            panic("missing file attrs")
+        }
+        fmt.Printf("attrs=%d:%d:%d\n", attrs.UID, attrs.GID, len(attrs.Extended))
+
+        realPath, err := client.RealPath(".")
+        if err != nil {
+            panic(err)
+        }
+        fmt.Printf("realpath=%s\n", realPath)
+
+        linkTarget, err := client.ReadLink("/latest")
+        if err != nil {
+            panic(err)
+        }
+        fmt.Printf("readlink=%s\n", linkTarget)
+
+        stat, err := client.StatVFS("/")
+        if err != nil {
+            panic(err)
+        }
+        fmt.Printf("statvfs=%d:%d\n", stat.Bsize, stat.Blocks)
+
+        if err = client.PosixRename("/upload.txt", "/renamed.txt"); err != nil {
+            panic(err)
+        }
+        storage.Mu.Lock()
+        fmt.Printf("posix=%s\n", storage.LastCommand)
+        storage.Mu.Unlock()
+
+        if err = client.Link("/greeting.txt", "/linked.txt"); err != nil {
+            panic(err)
+        }
+        storage.Mu.Lock()
+        fmt.Printf("link=%s\n", storage.LastCommand)
+        storage.Mu.Unlock()
+
+        if err = client.Mkdir("/new"); err != nil {
+            panic(err)
+        }
+        storage.Mu.Lock()
+        fmt.Printf("command=%s\n", storage.LastCommand)
+        storage.Mu.Unlock()
+
+        permissionErr := client.Mkdir("/forbidden")
+        fmt.Printf("permission=%v\n", errors.Is(permissionErr, os.ErrPermission))
+
+        large, err := client.Create("/large.txt")
+        if err != nil {
+            panic(err)
+        }
+        _, writeErr := large.Write([]byte("12345678"))
+        closeErr := large.Close()
+        fmt.Printf("limited=%v\n", writeErr != nil || closeErr != nil)
+
+        partial, err := client.Create("/partial.txt")
+        if err != nil {
+            panic(err)
+        }
+        _, partialWriteErr := partial.Write([]byte("x"))
+        partialCloseErr := partial.Close()
+        fmt.Printf("shortwrite=%v\n", partialWriteErr != nil || partialCloseErr != nil)
+
+        _ = client.Close()
+        _ = sshClient.Close()
+
+        rejectedConfig := &ssh.ClientConfig{
+            User:            "demo",
+            Auth:            []ssh.AuthMethod{ssh.Password("wrong")},
+            HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+        }
+        rejected, rejectErr := ssh.Dial("tcp", server.BoundAddress, rejectedConfig)
+        if rejectErr == nil {
+            _ = rejected.Close()
+        }
+        fmt.Printf("rejected=%v\n", rejectErr != nil)
+
+        _, privateKey, err := ed25519.GenerateKey(rand.Reader)
+        if err != nil {
+            panic(err)
+        }
+        signer, err := ssh.NewSignerFromKey(privateKey)
+        if err != nil {
+            panic(err)
+        }
+        keyConfig := &ssh.ClientConfig{
+            User:            "keyuser",
+            Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+            HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+        }
+        keyClient, keyErr := ssh.Dial("tcp", server.BoundAddress, keyConfig)
+        if keyErr == nil {
+            _ = keyClient.Close()
+        }
+        fmt.Printf("publickey=%v\n", keyErr == nil)
+    }
+
+    server.shutdown()
+    print(f"listening={server.isListening()}")
+    print(f"lifecycle={lifecycle.ready}:{lifecycle.listening}:{lifecycle.closed}:{lifecycle.errors}")
+    metrics: dict[str, int] = server.metricsSnapshot()
+    print(f"metrics={metrics['requests'] > 0 and metrics['bytesRead'] > 0 and metrics['bytesWritten'] > 0 and metrics['authSucceeded'] > 0}")
+    return Result.Ok(true)
+}
+
+func main() {
+    _ = run().unwrap()
+}

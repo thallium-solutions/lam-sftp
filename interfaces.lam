@@ -1,0 +1,43 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamerrors import Result
+from .models import SftpFile, SftpRequest, SftpStatVFS
+
+interface SftpStorage {
+    func read(request: SftpRequest) -> Result[list[int]]
+    func write(request: SftpRequest, data: list[int]) -> Result[int]
+    func list(request: SftpRequest) -> Result[list[SftpFile]]
+    func command(request: SftpRequest) -> Result[bool]
+}
+
+interface SftpProtocolStorage {
+    func statVFS(request: SftpRequest) -> Result[SftpStatVFS]
+    func realPath(path: str) -> Result[str]
+    func readlink(path: str) -> Result[str]
+    func lookupUsername(uid: str) -> str
+    func lookupGroupName(gid: str) -> str
+}
+
+interface SftpStreamingStorage {
+    func readAt(request: SftpRequest, offset: int, length: int) -> Result[list[int]]
+    func writeAt(request: SftpRequest, data: list[int], offset: int) -> Result[int]
+    func closeRead(request: SftpRequest) -> Result[bool]
+    func closeWrite(request: SftpRequest) -> Result[bool]
+}
+
+interface SftpBackend {
+    func read(request: SftpRequest) -> Result[list[int]]
+    func write(request: SftpRequest, data: list[int]) -> Result[int]
+    func list(request: SftpRequest) -> Result[list[SftpFile]]
+    func command(request: SftpRequest) -> Result[bool]
+    func readAt(request: SftpRequest, offset: int, length: int) -> Result[list[int]]
+    func writeAt(request: SftpRequest, data: list[int], offset: int) -> Result[int]
+    func closeRead(request: SftpRequest) -> Result[bool]
+    func closeWrite(request: SftpRequest) -> Result[bool]
+    func statVFS(request: SftpRequest) -> Result[SftpStatVFS]
+    func realPath(path: str) -> Result[str]
+    func readlink(path: str) -> Result[str]
+    func lookupUsername(uid: str) -> str
+    func lookupGroupName(gid: str) -> str
+}

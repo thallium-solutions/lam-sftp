@@ -1,0 +1,65 @@
+# expect: @lam/sftp@1.0.0
+# expect: false
+# expect: true
+# expect: true
+# expect: report.txt:file:12:420
+# expect: uploads:directory:493
+# expect: latest:symlink:/reports/latest
+# expect: Get:/hello.txt:false
+# expect: tenant=acme
+# expect: true
+# expect: true
+# expect: true
+
+from @lam/sftp import SftpAuth, SftpConfig, SftpErrors, SftpFile, SftpHandlers, SftpRequest, SftpServer, tag
+from lamerrors import Result
+
+class DemoStorage {
+    func read(self, _request: SftpRequest) -> Result[list[int]] {
+        return Result.Ok([])
+    }
+
+    func write(self, _request: SftpRequest, data: list[int]) -> Result[int] {
+        return Result.Ok(len(data))
+    }
+
+    func list(self, _request: SftpRequest) -> Result[list[SftpFile]] {
+        return Result.Ok([])
+    }
+
+    func command(self, _request: SftpRequest) -> Result[bool] {
+        return Result.Ok(true)
+    }
+}
+
+func main() {
+    print(tag())
+
+    missing: SftpConfig = SftpConfig()
+    print(missing.validate().ok())
+    valid: SftpConfig = SftpConfig("private-key")
+    print(valid.validate().ok())
+    print(not SftpConfig.fromKeyFile("/definitely/missing/lam-sftp-key").ok())
+
+    file: SftpFile = SftpFile.file("report.txt", 12)
+    directory: SftpFile = SftpFile.directory("uploads")
+    link: SftpFile = SftpFile.symlink("latest", "/reports/latest")
+    print(f"{file.name}:{file.kind}:{file.size}:{file.permissions}")
+    print(f"{directory.name}:{directory.kind}:{directory.permissions}")
+    print(f"{link.name}:{link.kind}:{link.target}")
+
+    request: SftpRequest = SftpRequest()
+    request.method = "Get"
+    request.path = "/hello.txt"
+    print(f"{request.method}:{request.path}:{request.write}")
+
+    auth: SftpAuth = SftpAuth().set("tenant", "acme")
+    print(f"tenant={auth.meta['tenant']}")
+
+    print(not SftpErrors.notFound("/missing").ok())
+    print(not SftpErrors.permissionDenied("/private").ok())
+
+    handlers: SftpHandlers = SftpHandlers().useStorage(DemoStorage())
+    server: SftpServer = SftpServer(valid, handlers)
+    print(not server.tryListenBackground().ok())
+}

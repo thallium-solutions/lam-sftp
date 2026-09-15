@@ -1,0 +1,417 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamerrors import Result
+from .models import SftpErrors, SftpFile, SftpRequest, SftpStatVFS
+from .interfaces import SftpBackend, SftpProtocolStorage, SftpStorage, SftpStreamingStorage
+from .metrics import SftpMetrics
+
+class SftpHandlers {
+    func __init__(self, read: func(SftpRequest) -> Result[list[int]] = None, write: func(SftpRequest, list[int]) -> Result[int] = None, list: func(SftpRequest) -> Result[list[SftpFile]] = None, command: func(SftpRequest) -> Result[bool] = None) {
+        self.readCallback: func(SftpRequest) -> Result[list[int]] = lambda(_request: SftpRequest) -> Result[list[int]]: SftpErrors.unsupported("Get")
+        self.writeCallback: func(SftpRequest, list[int]) -> Result[int] = lambda(request: SftpRequest, _data: list[int]) -> Result[int]: SftpErrors.unsupported(request.method)
+        self.listCallback: func(SftpRequest) -> Result[list[SftpFile]] = lambda(request: SftpRequest) -> Result[list[SftpFile]]: SftpErrors.unsupported(request.method)
+        self.commandCallback: func(SftpRequest) -> Result[bool] = lambda(request: SftpRequest) -> Result[bool]: SftpErrors.unsupported(request.method)
+        if read != None {
+            self.readCallback = read
+        }
+        if write != None {
+            self.writeCallback = write
+        }
+        if list != None {
+            self.listCallback = list
+        }
+        if command != None {
+            self.commandCallback = command
+        }
+        self.statVFSCallback: func(SftpRequest) -> Result[SftpStatVFS] = lambda(_request: SftpRequest) -> Result[SftpStatVFS]: SftpErrors.unsupported("StatVFS")
+        self.realPathCallback: func(str) -> Result[str] = lambda(path: str) -> Result[str]: SftpErrors.unsupported(path)
+        self.readlinkCallback: func(str) -> Result[str] = lambda(path: str) -> Result[str]: SftpErrors.unsupported(path)
+        self.usernameCallback: func(str) -> str = lambda(value: str) -> str: value
+        self.groupCallback: func(str) -> str = lambda(value: str) -> str: value
+        self.readAtCallback: func(SftpRequest, int, int) -> Result[list[int]] = lambda(_request: SftpRequest, _offset: int, _length: int) -> Result[list[int]]: SftpErrors.unsupported("readAt")
+        self.writeAtCallback: func(SftpRequest, list[int], int) -> Result[int] = lambda(_request: SftpRequest, _data: list[int], _offset: int) -> Result[int]: SftpErrors.unsupported("writeAt")
+        self.closeReadCallback: func(SftpRequest) -> Result[bool] = lambda(_request: SftpRequest) -> Result[bool]: Result.Ok(true)
+        self.closeWriteCallback: func(SftpRequest) -> Result[bool] = lambda(_request: SftpRequest) -> Result[bool]: Result.Ok(true)
+        self.transferErrorCallback: func(SftpRequest, any) = lambda(_request: SftpRequest, _error: any) -> None {
+            _ = _error
+        }
+        self.hasReadAt: bool = false
+        self.hasWriteAt: bool = false
+        self.hasStatVFS: bool = false
+        self.hasRealPath: bool = false
+        self.hasReadlink: bool = false
+        self.commandCallbacks: dict[str, func(SftpRequest) -> Result[bool]] = {}
+        self.guardCallbacks: list[func(SftpRequest) -> Result[bool]] = []
+        self.requestCallbacks: list[func(SftpRequest)] = []
+        self.resultCallbacks: list[func(SftpRequest, Result)] = []
+        self.metrics: SftpMetrics = SftpMetrics()
+        self.readOnly: bool = false
+    }
+
+    func onRead(self, callback: func(SftpRequest) -> Result[list[int]]) -> SftpHandlers {
+        self.readCallback = callback
+        return self
+    }
+
+    func onWrite(self, callback: func(SftpRequest, list[int]) -> Result[int]) -> SftpHandlers {
+        self.writeCallback = callback
+        return self
+    }
+
+    func onReadAt(self, callback: func(SftpRequest, int, int) -> Result[list[int]]) -> SftpHandlers {
+        self.readAtCallback = callback
+        self.hasReadAt = true
+        return self
+    }
+
+    func onWriteAt(self, callback: func(SftpRequest, list[int], int) -> Result[int]) -> SftpHandlers {
+        self.writeAtCallback = callback
+        self.hasWriteAt = true
+        return self
+    }
+
+    func onCloseRead(self, callback: func(SftpRequest) -> Result[bool]) -> SftpHandlers {
+        self.closeReadCallback = callback
+        return self
+    }
+
+    func onCloseWrite(self, callback: func(SftpRequest) -> Result[bool]) -> SftpHandlers {
+        self.closeWriteCallback = callback
+        return self
+    }
+
+    func onTransferError(self, callback: func(SftpRequest, any)) -> SftpHandlers {
+        self.transferErrorCallback = callback
+        return self
+    }
+
+    func onList(self, callback: func(SftpRequest) -> Result[list[SftpFile]]) -> SftpHandlers {
+        self.listCallback = callback
+        return self
+    }
+
+    func onCommand(self, callback: func(SftpRequest) -> Result[bool]) -> SftpHandlers {
+        self.commandCallback = callback
+        return self
+    }
+
+    func onStatVFS(self, callback: func(SftpRequest) -> Result[SftpStatVFS]) -> SftpHandlers {
+        self.statVFSCallback = callback
+        self.hasStatVFS = true
+        return self
+    }
+
+    func onRealPath(self, callback: func(str) -> Result[str]) -> SftpHandlers {
+        self.realPathCallback = callback
+        self.hasRealPath = true
+        return self
+    }
+
+    func onReadlink(self, callback: func(str) -> Result[str]) -> SftpHandlers {
+        self.readlinkCallback = callback
+        self.hasReadlink = true
+        return self
+    }
+
+    func onUsername(self, callback: func(str) -> str) -> SftpHandlers {
+        self.usernameCallback = callback
+        return self
+    }
+
+    func onGroupName(self, callback: func(str) -> str) -> SftpHandlers {
+        self.groupCallback = callback
+        return self
+    }
+
+    func onCommandMethod(self, method: str, callback: func(SftpRequest) -> Result[bool]) -> SftpHandlers {
+        self.commandCallbacks[method] = callback
+        return self
+    }
+
+    func onSetstat(self, callback: func(SftpRequest) -> Result[bool]) -> SftpHandlers {
+        return self.onCommandMethod("Setstat", callback)
+    }
+
+    func onRename(self, callback: func(SftpRequest) -> Result[bool]) -> SftpHandlers {
+        return self.onCommandMethod("Rename", callback)
+    }
+
+    func onRemove(self, callback: func(SftpRequest) -> Result[bool]) -> SftpHandlers {
+        return self.onCommandMethod("Remove", callback)
+    }
+
+    func onMkdir(self, callback: func(SftpRequest) -> Result[bool]) -> SftpHandlers {
+        return self.onCommandMethod("Mkdir", callback)
+    }
+
+    func onRmdir(self, callback: func(SftpRequest) -> Result[bool]) -> SftpHandlers {
+        return self.onCommandMethod("Rmdir", callback)
+    }
+
+    func onLink(self, callback: func(SftpRequest) -> Result[bool]) -> SftpHandlers {
+        return self.onCommandMethod("Link", callback)
+    }
+
+    func onSymlink(self, callback: func(SftpRequest) -> Result[bool]) -> SftpHandlers {
+        return self.onCommandMethod("Symlink", callback)
+    }
+
+    func onPosixRename(self, callback: func(SftpRequest) -> Result[bool]) -> SftpHandlers {
+        return self.onCommandMethod("PosixRename", callback)
+    }
+
+    func guard(self, callback: func(SftpRequest) -> Result[bool]) -> SftpHandlers {
+        self.guardCallbacks.append(callback)
+        return self
+    }
+
+    func onRequest(self, callback: func(SftpRequest)) -> SftpHandlers {
+        self.requestCallbacks.append(callback)
+        return self
+    }
+
+    func onResult(self, callback: func(SftpRequest, Result)) -> SftpHandlers {
+        self.resultCallbacks.append(callback)
+        return self
+    }
+
+    func setReadOnly(self, enabled: bool = true) -> SftpHandlers {
+        self.readOnly = enabled
+        return self
+    }
+
+    func useStorage(self, storage: any) -> SftpHandlers {
+        go! {
+            provider, ok := storage.(SftpStorage)
+            if !ok {
+                panic("SftpHandlers.useStorage: value does not satisfy SftpStorage")
+            }
+            s.ReadCallback = provider.Read
+            s.WriteCallback = provider.Write
+            s.ListCallback = provider.List
+            s.CommandCallback = provider.Command
+        }
+        return self
+    }
+
+    func useStreamingStorage(self, storage: any) -> SftpHandlers {
+        go! {
+            provider, ok := storage.(SftpStreamingStorage)
+            if !ok {
+                panic("SftpHandlers.useStreamingStorage: value does not satisfy SftpStreamingStorage")
+            }
+            s.ReadAtCallback = provider.ReadAt
+            s.WriteAtCallback = provider.WriteAt
+            s.CloseReadCallback = provider.CloseRead
+            s.CloseWriteCallback = provider.CloseWrite
+        }
+        self.hasReadAt = true
+        self.hasWriteAt = true
+        return self
+    }
+
+    func useBackend(self, storage: any) -> SftpHandlers {
+        go! {
+            backend, ok := storage.(SftpBackend)
+            if !ok {
+                panic("SftpHandlers.useBackend: value does not satisfy SftpBackend")
+            }
+            s.ReadCallback = backend.Read
+            s.WriteCallback = backend.Write
+            s.ListCallback = backend.List
+            s.CommandCallback = backend.Command
+            s.ReadAtCallback = backend.ReadAt
+            s.WriteAtCallback = backend.WriteAt
+            s.CloseReadCallback = backend.CloseRead
+            s.CloseWriteCallback = backend.CloseWrite
+            s.StatVFSCallback = backend.StatVFS
+            s.RealPathCallback = backend.RealPath
+            s.ReadlinkCallback = backend.Readlink
+            s.UsernameCallback = backend.LookupUsername
+            s.GroupCallback = backend.LookupGroupName
+        }
+        self.hasReadAt = true
+        self.hasWriteAt = true
+        self.hasStatVFS = true
+        self.hasRealPath = true
+        self.hasReadlink = true
+        return self
+    }
+
+    func useProtocolStorage(self, storage: any) -> SftpHandlers {
+        go! {
+            provider, ok := storage.(SftpProtocolStorage)
+            if !ok {
+                panic("SftpHandlers.useProtocolStorage: value does not satisfy SftpProtocolStorage")
+            }
+            s.StatVFSCallback = provider.StatVFS
+            s.RealPathCallback = provider.RealPath
+            s.ReadlinkCallback = provider.Readlink
+            s.UsernameCallback = provider.LookupUsername
+            s.GroupCallback = provider.LookupGroupName
+        }
+        self.hasStatVFS = true
+        self.hasRealPath = true
+        self.hasReadlink = true
+        return self
+    }
+
+    func _before(self, request: SftpRequest) -> Result[bool] {
+        self.metrics.requestStarted()
+        for callback in self.requestCallbacks {
+            callback(request)
+        }
+        for callback in self.guardCallbacks {
+            guarded: Result = callback(request)
+            if not guarded.ok() {
+                return guarded
+            }
+            allowed: bool = guarded?
+            if not allowed {
+                return SftpErrors.permissionDenied(request.path)
+            }
+        }
+        return Result.Ok(true)
+    }
+
+    func _after(self, request: SftpRequest, result: Result) {
+        self.metrics.requestFinished(result)
+        for callback in self.resultCallbacks {
+            callback(request, result)
+        }
+    }
+
+    func dispatchRead(self, request: SftpRequest) -> Result[list[int]] {
+        before: Result = self._before(request)
+        if not before.ok() {
+            self._after(request, before)
+            return before
+        }
+        result: Result = self.readCallback(request)
+        self._after(request, result)
+        return result
+    }
+
+    func dispatchWrite(self, request: SftpRequest, data: list[int]) -> Result[int] {
+        before: Result = self._before(request)
+        if not before.ok() {
+            self._after(request, before)
+            return before
+        }
+        if self.readOnly {
+            denied: Result = SftpErrors.permissionDenied(request.path)
+            self._after(request, denied)
+            return denied
+        }
+        result: Result = self.writeCallback(request, data)
+        self._after(request, result)
+        return result
+    }
+
+    func dispatchReadAt(self, request: SftpRequest, offset: int, length: int) -> Result[list[int]] {
+        before: Result = self._before(request)
+        if not before.ok() {
+            self._after(request, before)
+            return before
+        }
+        result: Result = self.readAtCallback(request, offset, length)
+        self._after(request, result)
+        return result
+    }
+
+    func dispatchWriteAt(self, request: SftpRequest, data: list[int], offset: int) -> Result[int] {
+        before: Result = self._before(request)
+        if not before.ok() {
+            self._after(request, before)
+            return before
+        }
+        if self.readOnly {
+            denied: Result = SftpErrors.permissionDenied(request.path)
+            self._after(request, denied)
+            return denied
+        }
+        result: Result = self.writeAtCallback(request, data, offset)
+        self._after(request, result)
+        return result
+    }
+
+    func dispatchCloseRead(self, request: SftpRequest) -> Result[bool] {
+        self.metrics.requestStarted()
+        result: Result = self.closeReadCallback(request)
+        self._after(request, result)
+        return result
+    }
+
+    func dispatchCloseWrite(self, request: SftpRequest) -> Result[bool] {
+        self.metrics.requestStarted()
+        result: Result = self.closeWriteCallback(request)
+        self._after(request, result)
+        return result
+    }
+
+    func dispatchList(self, request: SftpRequest) -> Result[list[SftpFile]] {
+        before: Result = self._before(request)
+        if not before.ok() {
+            self._after(request, before)
+            return before
+        }
+        result: Result = self.listCallback(request)
+        self._after(request, result)
+        return result
+    }
+
+    func dispatchCommand(self, request: SftpRequest) -> Result[bool] {
+        before: Result = self._before(request)
+        if not before.ok() {
+            self._after(request, before)
+            return before
+        }
+        if self.readOnly {
+            denied: Result = SftpErrors.permissionDenied(request.path)
+            self._after(request, denied)
+            return denied
+        }
+        result: Result = Result.Ok(false)
+        if request.method in self.commandCallbacks {
+            result = self.commandCallbacks[request.method](request)
+        } else {
+            result = self.commandCallback(request)
+        }
+        self._after(request, result)
+        return result
+    }
+
+    func dispatchStatVFS(self, request: SftpRequest) -> Result[SftpStatVFS] {
+        before: Result = self._before(request)
+        if not before.ok() {
+            self._after(request, before)
+            return before
+        }
+        result: Result = self.statVFSCallback(request)
+        self._after(request, result)
+        return result
+    }
+
+    func dispatchRealPath(self, request: SftpRequest) -> Result[str] {
+        before: Result = self._before(request)
+        if not before.ok() {
+            self._after(request, before)
+            return before
+        }
+        result: Result = self.realPathCallback(request.path)
+        self._after(request, result)
+        return result
+    }
+
+    func dispatchReadlink(self, request: SftpRequest) -> Result[str] {
+        before: Result = self._before(request)
+        if not before.ok() {
+            self._after(request, before)
+            return before
+        }
+        result: Result = self.readlinkCallback(request.path)
+        self._after(request, result)
+        return result
+    }
+}

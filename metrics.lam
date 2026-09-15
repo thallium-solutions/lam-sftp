@@ -1,0 +1,41 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamconcurrency import Atomic
+from lamerrors import Result
+
+class SftpMetrics {
+    func __init__(self) {
+        self.connectionsAccepted: Atomic = Atomic(0)
+        self.connectionsRejected: Atomic = Atomic(0)
+        self.authSucceeded: Atomic = Atomic(0)
+        self.authFailed: Atomic = Atomic(0)
+        self.requests: Atomic = Atomic(0)
+        self.failures: Atomic = Atomic(0)
+        self.bytesRead: Atomic = Atomic(0)
+        self.bytesWritten: Atomic = Atomic(0)
+    }
+
+    func requestStarted(self) {
+        _ = self.requests.increment()
+    }
+
+    func requestFinished(self, result: Result) {
+        if not result.ok() {
+            _ = self.failures.increment()
+        }
+    }
+
+    func snapshot(self) -> dict[str, int] {
+        return {
+            "connectionsAccepted": self.connectionsAccepted.get(),
+            "connectionsRejected": self.connectionsRejected.get(),
+            "authSucceeded": self.authSucceeded.get(),
+            "authFailed": self.authFailed.get(),
+            "requests": self.requests.get(),
+            "failures": self.failures.get(),
+            "bytesRead": self.bytesRead.get(),
+            "bytesWritten": self.bytesWritten.get(),
+        }
+    }
+}

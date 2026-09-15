@@ -1,0 +1,10 @@
+@lam/sftp
+
+Copyright 2026 Thallium Solutions di Busconi Alessandro.
+
+This product includes software developed by Thallium Solutions di Busconi
+Alessandro.
+
+@lam/sftp uses github.com/pkg/sftp, distributed under the BSD 2-Clause License,
+and golang.org/x/crypto, distributed under the BSD 3-Clause License. Those
+projects retain their own copyright and license terms.

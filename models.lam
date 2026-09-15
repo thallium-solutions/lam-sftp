@@ -1,0 +1,254 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamcontext import Context
+from lamerrors import Result, Error
+
+class SftpExtended {
+    func __init__(self, name: str, data: str) {
+        self.name: str = name
+        self.data: str = data
+    }
+}
+
+class SftpErrors {
+    static func notFound(path: str) -> Result {
+        return Result.Err(Error("SftpNotFound", f"not found: {path}", None))
+    }
+
+    static func permissionDenied(path: str) -> Result {
+        return Result.Err(Error("SftpPermissionDenied", f"permission denied: {path}", None))
+    }
+
+    static func alreadyExists(path: str) -> Result {
+        return Result.Err(Error("SftpAlreadyExists", f"already exists: {path}", None))
+    }
+
+    static func invalid(message: str) -> Result {
+        return Result.Err(Error("SftpInvalid", message, None))
+    }
+
+    static func unsupported(method: str) -> Result {
+        return Result.Err(Error("SftpUnsupported", f"unsupported SFTP operation: {method}", None))
+    }
+
+    static func eof() -> Result {
+        return Result.Err(Error("SftpEOF", "end of file", None))
+    }
+
+    static func noConnection(message: str = "no connection") -> Result {
+        return Result.Err(Error("SftpNoConnection", message, None))
+    }
+
+    static func connectionLost(message: str = "connection lost") -> Result {
+        return Result.Err(Error("SftpConnectionLost", message, None))
+    }
+
+    static func failure(message: str) -> Result {
+        return Result.Err(Error("SftpFailure", message, None))
+    }
+}
+
+class SftpAuth {
+    func __init__(self) {
+        self.username: str = ""
+        self.remoteAddress: str = ""
+        self.method: str = ""
+        self.password: str = ""
+        self.publicKey: str = ""
+        self.fingerprint: str = ""
+        self.meta: dict[str, str] = {}
+    }
+
+    func set(self, key: str, value: str) -> SftpAuth {
+        self.meta[key] = value
+        return self
+    }
+
+    func value(self, key: str, fallback: str = "") -> str {
+        if key in self.meta {
+            return self.meta[key]
+        }
+        return fallback
+    }
+}
+
+class SftpRequest {
+    func __init__(self) {
+        self.method: str = ""
+        self.path: str = ""
+        self.target: str = ""
+        self.user: str = ""
+        self.remoteAddress: str = ""
+        self.session: dict[str, str] = {}
+        self._context: any = None
+        self.read: bool = false
+        self.write: bool = false
+        self.append: bool = false
+        self.create: bool = false
+        self.truncate: bool = false
+        self.exclusive: bool = false
+        self.hasSize: bool = false
+        self.size: int = 0
+        self.hasUidGid: bool = false
+        self.uid: int = 0
+        self.gid: int = 0
+        self.hasPermissions: bool = false
+        self.permissions: int = 0
+        self.hasAccessTime: bool = false
+        self.accessedUnix: int = 0
+        self.hasModifiedTime: bool = false
+        self.modifiedUnix: int = 0
+        self.hasExtended: bool = false
+        self.extended: list[SftpExtended] = []
+    }
+
+    func key(self) -> str {
+        if self.path == "/" {
+            return ""
+        }
+        if self.path.startsWith("/") {
+            return self.path[1:]
+        }
+        return self.path
+    }
+
+    func basename(self) -> str {
+        parts: list[str] = self.path.split("/")
+        if len(parts) == 0 {
+            return ""
+        }
+        return parts[len(parts) - 1]
+    }
+
+    func sessionValue(self, key: str, fallback: str = "") -> str {
+        if key in self.session {
+            return self.session[key]
+        }
+        return fallback
+    }
+
+    func context(self) -> Context {
+        if self._context == None {
+            return Context.simple()
+        }
+        return Context.fromNative(self._context)
+    }
+
+    func cancelled(self) -> bool {
+        return self.context().expired()
+    }
+
+    func deadlineUnix(self) -> int {
+        deadlineMs: int = self.context().expiresIn(None)
+        if deadlineMs < 0 {
+            return 0
+        }
+        return deadlineMs / 1000
+    }
+
+    func isReadOperation(self) -> bool {
+        return self.method == "Get" or(self.method == "Open" and self.read)
+    }
+
+    func isListOperation(self) -> bool {
+        return self.method == "List" or self.method == "Stat" or self.method == "Lstat" or self.method == "Readlink"
+    }
+
+    func isWriteOperation(self) -> bool {
+        return self.method == "Put" or(self.method == "Open" and self.write)
+    }
+
+    func isCommandOperation(self) -> bool {
+        return not self.isReadOperation() and not self.isListOperation() and not self.isWriteOperation()
+    }
+}
+
+class SftpFile {
+    func __init__(self, name: str, size: int = 0, kind: str = "file", permissions: int = 420, modifiedUnix: int = 0, path: str = "", target: str = "", uid: int = 0, gid: int = 0, extended: list[SftpExtended] = []) {
+        self.name: str = name
+        self.path: str = path
+        self.size: int = size
+        self.kind: str = kind
+        self.permissions: int = permissions
+        self.modifiedUnix: int = modifiedUnix
+        self.target: str = target
+        self.uid: int = uid
+        self.gid: int = gid
+        self.extended: list[SftpExtended] = extended
+    }
+
+    static func file(name: str, size: int = 0, modifiedUnix: int = 0, permissions: int = 420) -> SftpFile {
+        return SftpFile(name, size, "file", permissions, modifiedUnix)
+    }
+
+    static func directory(name: str, modifiedUnix: int = 0, permissions: int = 493) -> SftpFile {
+        return SftpFile(name, 0, "directory", permissions, modifiedUnix)
+    }
+
+    static func symlink(name: str, target: str, modifiedUnix: int = 0, permissions: int = 511) -> SftpFile {
+        return SftpFile(name, 0, "symlink", permissions, modifiedUnix, "", target)
+    }
+
+    func validate(self) -> Result[bool] {
+        if self.name == "" {
+            return SftpErrors.invalid("SftpFile.name is required")
+        }
+        if self.size < 0 or self.uid < 0 or self.gid < 0 {
+            return SftpErrors.invalid("SftpFile size, uid, and gid cannot be negative")
+        }
+        if self.permissions < 0 or self.permissions > 4095 {
+            return SftpErrors.invalid("SftpFile.permissions must be between 0 and 4095")
+        }
+        if not self.isFile() and not self.isDirectory() and not self.isSymlink() {
+            return SftpErrors.invalid(f"unsupported SftpFile kind: {self.kind}")
+        }
+        if self.isSymlink() and self.target == "" {
+            return SftpErrors.invalid("symlink target is required")
+        }
+        return Result.Ok(true)
+    }
+
+    func at(self, path: str) -> SftpFile {
+        self.path = path
+        return self
+    }
+
+    func isFile(self) -> bool {
+        return self.kind == "file"
+    }
+
+    func isDirectory(self) -> bool {
+        return self.kind == "directory" or self.kind == "dir"
+    }
+
+    func isSymlink(self) -> bool {
+        return self.kind == "symlink" or self.kind == "link"
+    }
+}
+
+class SftpStatVFS {
+    func __init__(self, blockSize: int = 4096, fragmentSize: int = 4096, blocks: int = 0, blocksFree: int = 0, blocksAvailable: int = 0, files: int = 0, filesFree: int = 0, filesAvailable: int = 0, filesystemId: int = 0, flags: int = 0, nameMax: int = 255) {
+        self.blockSize: int = blockSize
+        self.fragmentSize: int = fragmentSize
+        self.blocks: int = blocks
+        self.blocksFree: int = blocksFree
+        self.blocksAvailable: int = blocksAvailable
+        self.files: int = files
+        self.filesFree: int = filesFree
+        self.filesAvailable: int = filesAvailable
+        self.filesystemId: int = filesystemId
+        self.flags: int = flags
+        self.nameMax: int = nameMax
+    }
+
+    func validate(self) -> Result[bool] {
+        if self.blockSize < 0 or self.fragmentSize < 0 or self.blocks < 0 or self.blocksFree < 0 or self.blocksAvailable < 0 {
+            return SftpErrors.invalid("StatVFS block values cannot be negative")
+        }
+        if self.files < 0 or self.filesFree < 0 or self.filesAvailable < 0 or self.filesystemId < 0 or self.flags < 0 or self.nameMax < 0 {
+            return SftpErrors.invalid("StatVFS file and metadata values cannot be negative")
+        }
+        return Result.Ok(true)
+    }
+}
