@@ -427,6 +427,16 @@ compatibility conveniences and are implemented through the same wrapper. A
 manually constructed request receives a live simple context; adapter-built
 requests wrap `github.com/pkg/sftp`'s native request context.
 
+```lammergeier
+requestContext: Context = request.context()
+closed: bool = requestContext.expired()
+absoluteExpiryMs: int = requestContext.expiresIn(None)
+remainingMs: int = requestContext.expiresIn("milliseconds")
+```
+
+`expiresIn(None)` returns the absolute Unix-millisecond expiry. Supplying a unit
+returns the remaining duration; both forms return `-1` when no expiry exists.
+
 `github.com/pkg/sftp` does not preserve the attribute-flags word from
 `SSH_FXP_OPEN` and ignores attributes on `SSH_FXP_MKDIR`. Therefore creation
 attributes are not exposed reliably; clients should issue `Setstat` after
