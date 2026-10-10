@@ -7,7 +7,7 @@ from .interfaces import SftpBackend, SftpProtocolStorage, SftpStorage, SftpStrea
 from .metrics import SftpMetrics
 
 class SftpHandlers {
-    func __init__(self, read: func(SftpRequest) -> Result[list[int]] = None, write: func(SftpRequest, list[int]) -> Result[int] = None, list: func(SftpRequest) -> Result[list[SftpFile]] = None, command: func(SftpRequest) -> Result[bool] = None) {
+    func init(self, read: func(SftpRequest) -> Result[list[int]] = None, write: func(SftpRequest, list[int]) -> Result[int] = None, list: func(SftpRequest) -> Result[list[SftpFile]] = None, command: func(SftpRequest) -> Result[bool] = None) {
         self.readCallback: func(SftpRequest) -> Result[list[int]] = lambda(_request: SftpRequest) -> Result[list[int]]: SftpErrors.unsupported("Get")
         self.writeCallback: func(SftpRequest, list[int]) -> Result[int] = lambda(request: SftpRequest, _data: list[int]) -> Result[int]: SftpErrors.unsupported(request.method)
         self.listCallback: func(SftpRequest) -> Result[list[SftpFile]] = lambda(request: SftpRequest) -> Result[list[SftpFile]]: SftpErrors.unsupported(request.method)
@@ -181,76 +181,84 @@ class SftpHandlers {
         return self
     }
 
-    func useStorage(self, storage: any) -> SftpHandlers {
-        go! {
-            provider, ok := storage.(SftpStorage)
-            if !ok {
-                panic("SftpHandlers.useStorage: value does not satisfy SftpStorage")
-            }
-            s.ReadCallback = provider.Read
-            s.WriteCallback = provider.Write
-            s.ListCallback = provider.List
-            s.CommandCallback = provider.Command
-        }
+    func use(self, storage: SftpStorage) -> SftpHandlers {
+        self.readCallback = storage.read
+        self.writeCallback = storage.write
+        self.listCallback = storage.list
+        self.commandCallback = storage.command
         return self
     }
 
-    func useStreamingStorage(self, storage: any) -> SftpHandlers {
-        go! {
-            provider, ok := storage.(SftpStreamingStorage)
-            if !ok {
-                panic("SftpHandlers.useStreamingStorage: value does not satisfy SftpStreamingStorage")
-            }
-            s.ReadAtCallback = provider.ReadAt
-            s.WriteAtCallback = provider.WriteAt
-            s.CloseReadCallback = provider.CloseRead
-            s.CloseWriteCallback = provider.CloseWrite
-        }
+    func use(self, storage: SftpStreamingStorage) -> SftpHandlers {
+        self.readAtCallback = storage.readAt
+        self.writeAtCallback = storage.writeAt
+        self.closeReadCallback = storage.closeRead
+        self.closeWriteCallback = storage.closeWrite
         self.hasReadAt = true
         self.hasWriteAt = true
         return self
     }
 
-    func useBackend(self, storage: any) -> SftpHandlers {
-        go! {
-            backend, ok := storage.(SftpBackend)
-            if !ok {
-                panic("SftpHandlers.useBackend: value does not satisfy SftpBackend")
-            }
-            s.ReadCallback = backend.Read
-            s.WriteCallback = backend.Write
-            s.ListCallback = backend.List
-            s.CommandCallback = backend.Command
-            s.ReadAtCallback = backend.ReadAt
-            s.WriteAtCallback = backend.WriteAt
-            s.CloseReadCallback = backend.CloseRead
-            s.CloseWriteCallback = backend.CloseWrite
-            s.StatVFSCallback = backend.StatVFS
-            s.RealPathCallback = backend.RealPath
-            s.ReadlinkCallback = backend.Readlink
-            s.UsernameCallback = backend.LookupUsername
-            s.GroupCallback = backend.LookupGroupName
-        }
-        self.hasReadAt = true
-        self.hasWriteAt = true
+    func use(self, storage: SftpProtocolStorage) -> SftpHandlers {
+        self.statVFSCallback = storage.statVFS
+        self.realPathCallback = storage.realPath
+        self.readlinkCallback = storage.readlink
+        self.usernameCallback = storage.lookupUsername
+        self.groupCallback = storage.lookupGroupName
         self.hasStatVFS = true
         self.hasRealPath = true
         self.hasReadlink = true
         return self
     }
 
-    func useProtocolStorage(self, storage: any) -> SftpHandlers {
-        go! {
-            provider, ok := storage.(SftpProtocolStorage)
-            if !ok {
-                panic("SftpHandlers.useProtocolStorage: value does not satisfy SftpProtocolStorage")
-            }
-            s.StatVFSCallback = provider.StatVFS
-            s.RealPathCallback = provider.RealPath
-            s.ReadlinkCallback = provider.Readlink
-            s.UsernameCallback = provider.LookupUsername
-            s.GroupCallback = provider.LookupGroupName
-        }
+    # Explicitly named installers keep each structural interface addressable at
+    # call sites where same-name overload resolution cannot infer conformance.
+    func useStorage(self, storage: SftpStorage) -> SftpHandlers {
+        self.readCallback = storage.read
+        self.writeCallback = storage.write
+        self.listCallback = storage.list
+        self.commandCallback = storage.command
+        return self
+    }
+
+    func useStreamingStorage(self, storage: SftpStreamingStorage) -> SftpHandlers {
+        self.readAtCallback = storage.readAt
+        self.writeAtCallback = storage.writeAt
+        self.closeReadCallback = storage.closeRead
+        self.closeWriteCallback = storage.closeWrite
+        self.hasReadAt = true
+        self.hasWriteAt = true
+        return self
+    }
+
+    func useProtocolStorage(self, storage: SftpProtocolStorage) -> SftpHandlers {
+        self.statVFSCallback = storage.statVFS
+        self.realPathCallback = storage.realPath
+        self.readlinkCallback = storage.readlink
+        self.usernameCallback = storage.lookupUsername
+        self.groupCallback = storage.lookupGroupName
+        self.hasStatVFS = true
+        self.hasRealPath = true
+        self.hasReadlink = true
+        return self
+    }
+
+    func useBackend(self, storage: SftpBackend) -> SftpHandlers {
+        self.readCallback = storage.read
+        self.writeCallback = storage.write
+        self.listCallback = storage.list
+        self.commandCallback = storage.command
+        self.readAtCallback = storage.readAt
+        self.writeAtCallback = storage.writeAt
+        self.closeReadCallback = storage.closeRead
+        self.closeWriteCallback = storage.closeWrite
+        self.statVFSCallback = storage.statVFS
+        self.realPathCallback = storage.realPath
+        self.readlinkCallback = storage.readlink
+        self.usernameCallback = storage.lookupUsername
+        self.groupCallback = storage.lookupGroupName
+        self.hasReadAt = true
+        self.hasWriteAt = true
         self.hasStatVFS = true
         self.hasRealPath = true
         self.hasReadlink = true

@@ -40,7 +40,7 @@ class MemoryStorage {
 }
 
 class Probe {
-    func __init__(self) {
+    func init(self) {
         self.requests: int = 0
         self.results: int = 0
         self.errors: int = 0
@@ -73,6 +73,15 @@ func allowAuth(_auth: SftpAuth) -> bool {
     return true
 }
 
+func printRequestContext(request: SftpRequest) -> Result {
+    requestContext: Context = request.context()?
+    expiresAt: int = requestContext.expiresIn(None)?
+    deadlineUnix: int = request.deadlineUnix()?
+    cancelled: bool = request.cancelled()?
+    print(f"{requestContext.expired()}:{expiresAt}:{deadlineUnix}:{not cancelled}")
+    return Result.Ok(None)
+}
+
 func main() {
     request: SftpRequest = SftpRequest()
     request.method = "Get"
@@ -81,8 +90,7 @@ func main() {
     print(request.key())
     print(request.basename())
     print(f"{request.sessionValue('tenant')}:{request.sessionValue('missing', 'none')}")
-    requestContext: Context = request.context()
-    print(f"{requestContext.expired()}:{requestContext.expiresIn(None)}:{request.deadlineUnix()}:{not request.cancelled()}")
+    _ = printRequestContext(request)
     print(f"{request.isReadOperation()}:{request.isWriteOperation()}:{request.isCommandOperation()}")
     request.method = "Open"
     request.read = true
@@ -100,7 +108,7 @@ func main() {
     print(SftpStatVFS(-1).validate().ok())
 
     probe: Probe = Probe()
-    handlers: SftpHandlers = SftpHandlers().useStorage(MemoryStorage())
+    handlers: SftpHandlers = SftpHandlers().use(MemoryStorage())
     _ = handlers.onRequest(probe.request).onResult(probe.result).guard(probe.guard)
 
     print(handlers.dispatchRead(request).ok())
@@ -126,5 +134,5 @@ func main() {
     server: SftpServer = SftpServer(config, handlers)
     server = server.onPasswordAuth(allowAuth)
     server = server.onError(probe.error)
-    print(f"{not server.tryListenBackground().ok()}:{probe.errors}")
+    print(f"{not server.listenBackground().ok()}:{probe.errors}")
 }

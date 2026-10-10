@@ -26,6 +26,7 @@ from @lam/sftp import SftpAuth, SftpConfig, SftpErrors, SftpExtended, SftpFile, 
 from @lam/ssh import SshKeyPair
 from lambytes import Bytes
 from lamconcurrency import Mutex
+from lamcontext import Context
 from lamerrors import Result
 
 go! {
@@ -43,7 +44,7 @@ go! {
 }
 
 class MemoryStorage {
-    func __init__(self) {
+    func init(self) {
         self.mu: Mutex = Mutex()
         self.upload: list[int] = []
         self.hasUpload: bool = false
@@ -52,8 +53,10 @@ class MemoryStorage {
     }
 
     func read(self, request: SftpRequest) -> Result[list[int]] {
+        requestContext: Context = request.context()?
+        deadlineUnix: int = request.deadlineUnix()?
         self.mu.lock()
-        self.contextActive = self.contextActive or(not request.context().expired() and request.deadlineUnix() == 0)
+        self.contextActive = self.contextActive or(not requestContext.expired() and deadlineUnix == 0)
         self.mu.unlock()
         if request.path == "/greeting.txt" {
             return Result.Ok(Bytes.toBytes("hello"))
@@ -177,7 +180,7 @@ class MemoryStorage {
 }
 
 class Lifecycle {
-    func __init__(self) {
+    func init(self) {
         self.ready: bool = false
         self.listening: bool = false
         self.closed: bool = false
@@ -226,7 +229,7 @@ func run() -> Result[bool] {
     _ = server.onListen(lifecycle.onListen)
     _ = server.onClose(lifecycle.onClose)
     _ = server.onError(lifecycle.onError)
-    print(f"listening={server.listenBackground()}")
+    print(f"listening={server.listenBackground()?}")
 
     go! {
         clientConfig := &ssh.ClientConfig{

@@ -1,0 +1,545 @@
+# expect: hostkey=true
+# expect: listening=true
+# expect: lifecycle-start=true:true:false:0
+# expect: password-auth=true
+# expect: initial=seed-data
+# expect: request-session=true
+# expect: request-context=true
+# expect: upload=abcdef
+# expect: close-callbacks=true:true
+# expect: list=true
+# expect: stat=6
+# expect: realpath=/root/upload.txt
+# expect: statvfs=8192:77
+# expect: mkdir=true
+# expect: rename=abcdef
+# expect: remove=true
+# expect: guarded=true
+# expect: missing=true
+# expect: shortwrite=true
+# expect: transfer-error=true
+# expect: rejected=true
+# expect: publickey=true
+# expect: listening=false
+# expect: lifecycle-stop=true:true:true:0
+# expect: callbacks=true
+# expect: metrics=true
+
+from @lam/sftp import SftpAuth, SftpConfig, SftpErrors, SftpFile, SftpKey, SftpRequest, SftpServer, SftpStatVFS
+from @lam/ssh import SshKeyPair
+from lambytes import Bytes
+from lamconcurrency import Mutex
+from lamcontext import Context
+from lamerrors import Result
+
+go! {
+    import (
+        "errors"
+        "fmt"
+        "io"
+        "os"
+
+        clientsftp "github.com/pkg/sftp"
+        "golang.org/x/crypto/ssh"
+    )
+
+    func readSftpFile(client *clientsftp.Client, path string) ([]byte, error) {
+        file, err := client.Open(path)
+        if err != nil {
+            return nil, err
+        }
+        defer file.Close()
+        return io.ReadAll(file)
+    }
+}
+
+class IntegrationState {
+    func init(self) {
+        self.mu: Mutex = Mutex()
+        self.data: list[int] = []
+        self.hasUpload: bool = false
+        self.currentPath: str = "/upload.txt"
+        self.closeReads: int = 0
+        self.closeWrites: int = 0
+        self.transferErrors: int = 0
+        self.requests: int = 0
+        self.results: int = 0
+        self.failedResults: int = 0
+        self.commands: int = 0
+        self.sessionSeen: bool = false
+        self.contextSeen: bool = false
+        self.protocolCalls: int = 0
+    }
+
+    func inspect(self, request: SftpRequest) -> Result[bool] {
+        requestContext: Context = request.context()?
+        deadline: int = request.deadlineUnix()?
+        cancelled: bool = request.cancelled()?
+        self.mu.lock()
+        self.sessionSeen = self.sessionSeen or request.sessionValue("tenant") == "typed-storage"
+        self.contextSeen = self.contextSeen or(not requestContext.expired() and not cancelled and deadline == 0)
+        self.mu.unlock()
+        return Result.Ok(true)
+    }
+
+    func onRequest(self, _request: SftpRequest) {
+        self.mu.lock()
+        self.requests += 1
+        self.mu.unlock()
+    }
+
+    func onResult(self, _request: SftpRequest, result: Result) {
+        self.mu.lock()
+        self.results += 1
+        if not result.ok() {
+            self.failedResults += 1
+        }
+        self.mu.unlock()
+    }
+
+    func guard(self, request: SftpRequest) -> Result[bool] {
+        return Result.Ok(request.path != "/guarded")
+    }
+
+    func onTransferError(self, _request: SftpRequest, _error: any) {
+        self.mu.lock()
+        self.transferErrors += 1
+        self.mu.unlock()
+    }
+}
+
+class CoreStorage {
+    func init(self, state: IntegrationState) {
+        self.state: IntegrationState = state
+    }
+
+    func read(self, request: SftpRequest) -> Result[list[int]] {
+        _ = self.state.inspect(request)?
+        if request.path == "/seed.txt" {
+            return Result.Ok(Bytes.toBytes("seed-data"))
+        }
+        self.state.mu.lock()
+        exists: bool = self.state.hasUpload and request.path == self.state.currentPath
+        data: list[int] = self.state.data
+        self.state.mu.unlock()
+        if exists {
+            return Result.Ok(data)
+        }
+        return SftpErrors.notFound(request.path)
+    }
+
+    func write(self, request: SftpRequest, data: list[int]) -> Result[int] {
+        _ = self.state.inspect(request)?
+        self.state.mu.lock()
+        self.state.data = data
+        self.state.hasUpload = true
+        self.state.currentPath = request.path
+        self.state.mu.unlock()
+        return Result.Ok(len(data))
+    }
+
+    func list(self, request: SftpRequest) -> Result[list[SftpFile]] {
+        _ = self.state.inspect(request)?
+        if request.path == "/" {
+            if request.method == "Stat" or request.method == "Lstat" {
+                return Result.Ok([SftpFile.directory("/")])
+            }
+            self.state.mu.lock()
+            exists: bool = self.state.hasUpload
+            name: str = self.state.currentPath.split("/")[1]
+            size: int = len(self.state.data)
+            self.state.mu.unlock()
+            entries: list[SftpFile] = [SftpFile.file("seed.txt", 9)]
+            if exists {
+                entries.append(SftpFile.file(name, size))
+            }
+            return Result.Ok(entries)
+        }
+        if request.path == "/seed.txt" {
+            return Result.Ok([SftpFile.file("seed.txt", 9)])
+        }
+        self.state.mu.lock()
+        exists: bool = self.state.hasUpload and request.path == self.state.currentPath
+        size: int = len(self.state.data)
+        name: str = self.state.currentPath.split("/")[1]
+        self.state.mu.unlock()
+        if exists {
+            return Result.Ok([SftpFile.file(name, size)])
+        }
+        return SftpErrors.notFound(request.path)
+    }
+
+    func command(self, request: SftpRequest) -> Result[bool] {
+        _ = self.state.inspect(request)?
+        self.state.mu.lock()
+        if request.method == "Rename" and self.state.hasUpload and request.path == self.state.currentPath {
+            self.state.currentPath = request.target
+        }
+        if request.method == "Remove" and request.path == self.state.currentPath {
+            self.state.hasUpload = false
+        }
+        self.state.commands += 1
+        self.state.mu.unlock()
+        return Result.Ok(true)
+    }
+}
+
+class StreamingStorage {
+    func init(self, state: IntegrationState) {
+        self.state: IntegrationState = state
+    }
+
+    func readAt(self, request: SftpRequest, offset: int, length: int) -> Result[list[int]] {
+        _ = self.state.inspect(request)?
+        data: list[int] = []
+        if request.path == "/seed.txt" {
+            data = Bytes.toBytes("seed-data")
+        } else {
+            self.state.mu.lock()
+            exists: bool = self.state.hasUpload and request.path == self.state.currentPath
+            data = self.state.data
+            self.state.mu.unlock()
+            if not exists {
+                return SftpErrors.notFound(request.path)
+            }
+        }
+        if offset >= len(data) {
+            return Result.Ok([])
+        }
+        end: int = offset + length
+        if end > len(data) {
+            end = len(data)
+        }
+        return Result.Ok(data[offset: end])
+    }
+
+    func writeAt(self, request: SftpRequest, data: list[int], offset: int) -> Result[int] {
+        _ = self.state.inspect(request)?
+        if request.path == "/short.txt" {
+            return Result.Ok(len(data) - 1)
+        }
+        end: int = offset + len(data)
+        self.state.mu.lock()
+        while len(self.state.data) < end {
+            self.state.data.append(0)
+        }
+        for index in range(len(data)) {
+            self.state.data[offset + index] = data[index]
+        }
+        self.state.hasUpload = true
+        self.state.currentPath = request.path
+        self.state.mu.unlock()
+        return Result.Ok(len(data))
+    }
+
+    func closeRead(self, _request: SftpRequest) -> Result[bool] {
+        self.state.mu.lock()
+        self.state.closeReads += 1
+        self.state.mu.unlock()
+        return Result.Ok(true)
+    }
+
+    func closeWrite(self, _request: SftpRequest) -> Result[bool] {
+        self.state.mu.lock()
+        self.state.closeWrites += 1
+        self.state.mu.unlock()
+        return Result.Ok(true)
+    }
+}
+
+class ProtocolStorage {
+    func init(self, state: IntegrationState) {
+        self.state: IntegrationState = state
+    }
+
+    func statVFS(self, request: SftpRequest) -> Result[SftpStatVFS] {
+        _ = self.state.inspect(request)?
+        self.state.mu.lock()
+        self.state.protocolCalls += 1
+        self.state.mu.unlock()
+        return Result.Ok(SftpStatVFS(8192, 4096, 77, 40, 30, 20, 10, 8, 3, 0, 255))
+    }
+
+    func realPath(self, path: str) -> Result[str] {
+        self.state.mu.lock()
+        self.state.protocolCalls += 1
+        self.state.mu.unlock()
+        if path.startsWith("/") {
+            return Result.Ok("/root" + path)
+        }
+        return Result.Ok("/root/" + path)
+    }
+
+    func readlink(self, path: str) -> Result[str] {
+        self.state.mu.lock()
+        self.state.protocolCalls += 1
+        self.state.mu.unlock()
+        if path == "/latest" {
+            return Result.Ok("/seed.txt")
+        }
+        return SftpErrors.notFound(path)
+    }
+
+    func lookupUsername(self, uid: str) -> str {
+        return "user-" + uid
+    }
+
+    func lookupGroupName(self, gid: str) -> str {
+        return "group-" + gid
+    }
+}
+
+class LifecycleProbe {
+    func init(self) {
+        self.mu: Mutex = Mutex()
+        self.ready: bool = false
+        self.listening: bool = false
+        self.closed: bool = false
+        self.errors: int = 0
+    }
+
+    func onReady(self, _server: SftpServer) {
+        self.mu.lock()
+        self.ready = true
+        self.mu.unlock()
+    }
+
+    func onListen(self, _server: SftpServer) {
+        self.mu.lock()
+        self.listening = true
+        self.mu.unlock()
+    }
+
+    func onClose(self, _server: SftpServer) {
+        self.mu.lock()
+        self.closed = true
+        self.mu.unlock()
+    }
+
+    func onError(self, _error: any) {
+        self.mu.lock()
+        self.errors += 1
+        self.mu.unlock()
+    }
+}
+
+class AuthProbe {
+    func init(self, fingerprint: str) {
+        self.mu: Mutex = Mutex()
+        self.expectedFingerprint: str = fingerprint
+        self.passwordAccepted: int = 0
+        self.publicKeyAccepted: int = 0
+    }
+
+    func password(self, auth: SftpAuth) -> bool {
+        accepted: bool = auth.username == "typed-user" and auth.method == "password" and auth.password == "typed-secret"
+        if accepted {
+            _ = auth.set("tenant", "typed-storage")
+            self.mu.lock()
+            self.passwordAccepted += 1
+            self.mu.unlock()
+        }
+        return accepted
+    }
+
+    func publicKey(self, auth: SftpAuth) -> bool {
+        accepted: bool = auth.username == "key-user" and auth.method == "publicKey" and auth.fingerprint == self.expectedFingerprint and auth.publicKey.startsWith("ssh-ed25519 ")
+        if accepted {
+            _ = auth.set("tenant", "typed-storage")
+            self.mu.lock()
+            self.publicKeyAccepted += 1
+            self.mu.unlock()
+        }
+        return accepted
+    }
+}
+
+func run() -> Result[bool] {
+    hostKey: str = SftpKey.generate()?
+    userPair: SshKeyPair = SshKeyPair.generateEd25519("sftp-complex-user")?
+    print(f"hostkey={hostKey.startsWith('-----BEGIN OPENSSH PRIVATE KEY-----')}")
+
+    config: SftpConfig = SftpConfig(hostKey, "127.0.0.1:0")
+    config = config.withReadLimit(1024).withWriteLimit(1024).withPacketSize(32768).withConnectionLimit(8).withTimeouts(1000, 2000).withAuthRateLimit(100, 100).productionMode()
+    state: IntegrationState = IntegrationState()
+    core: CoreStorage = CoreStorage(state)
+    streaming: StreamingStorage = StreamingStorage(state)
+    protocol: ProtocolStorage = ProtocolStorage(state)
+    lifecycle: LifecycleProbe = LifecycleProbe()
+    auth: AuthProbe = AuthProbe(userPair.sha256Fingerprint())
+
+    server: SftpServer = SftpServer(config)
+    _ = server.use(core)
+    _ = server.useStreamingStorage(streaming)
+    _ = server.useProtocolStorage(protocol)
+    _ = server.onPasswordAuth(auth.password).onPublicKeyAuth(auth.publicKey)
+    _ = server.guard(state.guard).onRequest(state.onRequest).onResult(state.onResult).onTransferError(state.onTransferError)
+    _ = server.onReady(lifecycle.onReady).onListen(lifecycle.onListen).onClose(lifecycle.onClose).onError(lifecycle.onError)
+    print(f"listening={server.listenBackground()?}")
+    lifecycle.mu.lock()
+    print(f"lifecycle-start={lifecycle.ready}:{lifecycle.listening}:{lifecycle.closed}:{lifecycle.errors}")
+    lifecycle.mu.unlock()
+
+    go! {
+        passwordConfig := &ssh.ClientConfig{
+            User:            "typed-user",
+            Auth:            []ssh.AuthMethod{ssh.Password("typed-secret")},
+            HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+        }
+        sshClient, err := ssh.Dial("tcp", server.BoundAddress, passwordConfig)
+        if err != nil {
+            panic(err)
+        }
+        client, err := clientsftp.NewClient(sshClient)
+        if err != nil {
+            panic(err)
+        }
+        auth.Mu.Lock()
+        fmt.Printf("password-auth=%v\n", auth.PasswordAccepted == 1)
+        auth.Mu.Unlock()
+
+        initial, err := readSftpFile(client, "/seed.txt")
+        if err != nil {
+            panic(err)
+        }
+        fmt.Printf("initial=%s\n", initial)
+        state.Mu.Lock()
+        fmt.Printf("request-session=%v\n", state.SessionSeen)
+        fmt.Printf("request-context=%v\n", state.ContextSeen)
+        state.Mu.Unlock()
+
+        upload, err := client.Create("/upload.txt")
+        if err != nil {
+            panic(err)
+        }
+        if _, err = upload.Write([]byte("abcdef")); err != nil {
+            panic(err)
+        }
+        if err = upload.Close(); err != nil {
+            panic(err)
+        }
+        uploaded, err := readSftpFile(client, "/upload.txt")
+        if err != nil {
+            panic(err)
+        }
+        fmt.Printf("upload=%s\n", uploaded)
+        state.Mu.Lock()
+        fmt.Printf("close-callbacks=%v:%v\n", state.CloseReads > 0, state.CloseWrites > 0)
+        state.Mu.Unlock()
+
+        entries, err := client.ReadDir("/")
+        if err != nil && err != io.EOF {
+            panic(err)
+        }
+        foundSeed, foundUpload := false, false
+        for _, entry := range entries {
+            foundSeed = foundSeed || entry.Name() == "seed.txt"
+            foundUpload = foundUpload || entry.Name() == "upload.txt"
+        }
+        fmt.Printf("list=%v\n", len(entries) == 2 && foundSeed && foundUpload)
+        info, err := client.Stat("/upload.txt")
+        if err != nil {
+            panic(err)
+        }
+        fmt.Printf("stat=%d\n", info.Size())
+
+        realPath, err := client.RealPath("upload.txt")
+        if err != nil {
+            panic(err)
+        }
+        fmt.Printf("realpath=%s\n", realPath)
+        stat, err := client.StatVFS("/")
+        if err != nil {
+            panic(err)
+        }
+        fmt.Printf("statvfs=%d:%d\n", stat.Bsize, stat.Blocks)
+
+        mkdirErr := client.Mkdir("/group")
+        fmt.Printf("mkdir=%v\n", mkdirErr == nil)
+        if err = client.Rename("/upload.txt", "/renamed.txt"); err != nil {
+            panic(err)
+        }
+        renamed, err := readSftpFile(client, "/renamed.txt")
+        if err != nil {
+            panic(err)
+        }
+        fmt.Printf("rename=%s\n", renamed)
+        if err = client.Remove("/renamed.txt"); err != nil {
+            panic(err)
+        }
+        _, removedErr := client.Stat("/renamed.txt")
+        fmt.Printf("remove=%v\n", removedErr != nil)
+
+        guardedErr := client.Mkdir("/guarded")
+        fmt.Printf("guarded=%v\n", errors.Is(guardedErr, os.ErrPermission))
+        _, missingErr := readSftpFile(client, "/missing.txt")
+        fmt.Printf("missing=%v\n", missingErr != nil)
+
+        shortFile, err := client.Create("/short.txt")
+        if err != nil {
+            panic(err)
+        }
+        _, shortWriteErr := shortFile.Write([]byte("x"))
+        shortCloseErr := shortFile.Close()
+        fmt.Printf("shortwrite=%v\n", shortWriteErr != nil || shortCloseErr != nil)
+        state.Mu.Lock()
+        fmt.Printf("transfer-error=%v\n", state.TransferErrors > 0)
+        state.Mu.Unlock()
+
+        _ = client.Close()
+        _ = sshClient.Close()
+
+        rejectedConfig := &ssh.ClientConfig{
+            User:            "typed-user",
+            Auth:            []ssh.AuthMethod{ssh.Password("wrong")},
+            HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+        }
+        rejectedClient, rejectedErr := ssh.Dial("tcp", server.BoundAddress, rejectedConfig)
+        if rejectedErr == nil {
+            _ = rejectedClient.Close()
+        }
+        fmt.Printf("rejected=%v\n", rejectedErr != nil)
+
+        signer, err := ssh.ParsePrivateKey([]byte(userPair.PrivateKeyPem))
+        if err != nil {
+            panic(err)
+        }
+        keyConfig := &ssh.ClientConfig{
+            User:            "key-user",
+            Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+            HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+        }
+        keySshClient, keyErr := ssh.Dial("tcp", server.BoundAddress, keyConfig)
+        keyWorked := keyErr == nil
+        if keyWorked {
+            keyClient, openErr := clientsftp.NewClient(keySshClient)
+            if openErr != nil {
+                panic(openErr)
+            }
+            _, readErr := readSftpFile(keyClient, "/seed.txt")
+            keyWorked = readErr == nil
+            _ = keyClient.Close()
+            _ = keySshClient.Close()
+        }
+        auth.Mu.Lock()
+        keyWorked = keyWorked && auth.PublicKeyAccepted == 1
+        auth.Mu.Unlock()
+        fmt.Printf("publickey=%v\n", keyWorked)
+    }
+
+    server.shutdown()
+    print(f"listening={server.isListening()}")
+    lifecycle.mu.lock()
+    print(f"lifecycle-stop={lifecycle.ready}:{lifecycle.listening}:{lifecycle.closed}:{lifecycle.errors}")
+    lifecycle.mu.unlock()
+    state.mu.lock()
+    print(f"callbacks={state.requests >= 12 and state.results >= state.requests and state.failedResults >= 2 and state.commands >= 3 and state.protocolCalls >= 2}")
+    state.mu.unlock()
+    metrics: dict[str, int] = server.metricsSnapshot()
+    print(f"metrics={metrics['connectionsAccepted'] >= 3 and metrics['authSucceeded'] >= 2 and metrics['authFailed'] >= 1 and metrics['requests'] >= 12 and metrics['failures'] >= 2 and metrics['bytesRead'] > 0 and metrics['bytesWritten'] >= 6}")
+    return Result.Ok(true)
+}
+
+func main() {
+    _ = run().unwrap()
+}

@@ -26,7 +26,7 @@ reach.
 - Per-command sugar (`onMkdir`, `onRemove`, `onRename`, and others), request
   guards, request/result observers, and a server-wide read-only switch.
 - In-memory OpenSSH Ed25519 host-key generation delegated to `@lam/ssh` and
-  Lam 1.16's `lamcrypto` ecosystem, plus host-key loading through `lamos`.
+  Lam 1.18's `lamcrypto` ecosystem, plus host-key loading through `lamos`.
 - Configurable read and upload memory limits, each defaulting to 64 MiB.
 
 ## Lam-first implementation
@@ -34,7 +34,7 @@ reach.
 Request policy, callback dispatch, storage adaptation, command routing,
 lifecycle orchestration, guards, observers, and read-only behavior are written
 in Lammergeier. Generic Ed25519 generation and OpenSSH key conversion belong to
-`@lam/ssh`, which in turn uses Lam 1.16's `lamcrypto`; request cancellation and
+`@lam/ssh`, which in turn uses Lam 1.18's `lamcrypto`; request cancellation and
 expiration are exposed as `lamcontext.Context`. The raw request context is kept
 only in `SftpRequest._context` as the adapter slot required by
 `github.com/pkg/sftp`.
@@ -71,9 +71,9 @@ from @lam/sftp import SftpServer, SftpConfig, SftpHandlers
 
 ## Requirements
 
-- Lammergeier compiler (`lamc`) **1.16.0 or newer** within the compatible
-  `1.x` line (`^1.16`).
-- `@lam/ssh` v1.0.0, resolved transitively from its pinned Git release.
+- Lammergeier compiler (`lamc`) **1.18.0 or newer** within the compatible
+  `1.x` line (`^1.18`).
+- `@lam/ssh` v2.0.0, resolved transitively from its pinned Git release.
 - Go **1.25.0 or newer**, required by `github.com/pkg/sftp v1.13.11`.
 
 ## Compliance profile
@@ -95,16 +95,16 @@ engine. Open and Mkdir creation-attribute limitations inherited from
 ## Installation
 
 Install the package directly from its Git release. Its manifest resolves the
-pinned `@lam/ssh` v1.0.0 dependency transitively:
+pinned `@lam/ssh` v2.0.0 dependency transitively:
 
 ```bash
-lamc install https://github.com/thallium-solutions/lam-sftp.git@v1.0.0
+lamc install https://github.com/thallium-solutions/lam-sftp.git@v2.0.0
 ```
 
 After a registry release, use the canonical scoped name:
 
 ```bash
-lamc install @lam/sftp@1.0.0
+lamc install @lam/sftp@2.0.0
 ```
 
 For sibling-checkout development, declare the package in an application project
@@ -166,7 +166,7 @@ from lamcontext import Context
 from lamerrors import Result
 
 func readFile(request: SftpRequest) -> Result[list[int]] {
-    requestContext: Context = request.context()
+    requestContext: Context = request.context()?
     if requestContext.expired() {
         return SftpErrors.connectionLost("client disconnected")
     }
@@ -189,22 +189,18 @@ func listFiles(request: SftpRequest) -> Result[list[SftpFile]] {
     return SftpErrors.notFound(request.path)
 }
 
-func main() {
-    do {
-        config: SftpConfig = SftpConfig.fromKeyFile("./sftp_host_key")?
-        handlers: SftpHandlers = SftpHandlers(
-            read = readFile,
-            list = listFiles,
-            write = lambda (req: SftpRequest, data: list[int]) -> Result[int]: SftpErrors.permissionDenied(req.path),
-            command = lambda (req: SftpRequest) -> Result[bool]: SftpErrors.unsupported(req.method),
-        )
+func serve() -> Result {
+    config: SftpConfig = SftpConfig.fromKeyFile("./sftp_host_key")?
+    handlers: SftpHandlers = SftpHandlers(
+        read = readFile,
+        list = listFiles,
+        write = lambda (req: SftpRequest, data: list[int]) -> Result[int]: SftpErrors.permissionDenied(req.path),
+        command = lambda (req: SftpRequest) -> Result[bool]: SftpErrors.unsupported(req.method),
+    )
 
-        server: SftpServer = SftpServer(config, handlers)
-        _ = server.onPasswordAuth(lambda (auth: SftpAuth) -> bool: auth.username == "demo" and auth.password == "change-me")
-        _ = server.tryListen()?
-    } catch err {
-        print(f"SFTP failed: {err}")
-    }
+    server: SftpServer = SftpServer(config, handlers)
+    _ = server.onPasswordAuth(lambda (auth: SftpAuth) -> bool: auth.username == "demo" and auth.password == "change-me")
+    return server.listen()
 }
 ```
 
@@ -226,16 +222,16 @@ from @lam/s3 import S3Client
 from lamerrors import Result
 
 class BucketStorage {
-    func __init__(self, bucket: S3Client) {
+    func init(self, bucket: S3Client) {
         self.bucket: S3Client = bucket
     }
 
     func read(self, request: SftpRequest) -> Result[list[int]] {
-        return self.bucket.tryGetBuffer(request.path[1:])
+        return self.bucket.getBuffer(request.path[1:])
     }
 
     func write(self, request: SftpRequest, data: list[int]) -> Result[int] {
-        uploaded: Result = self.bucket.tryPutBuffer(request.path[1:], data)
+        uploaded: Result = self.bucket.putBuffer(request.path[1:], data)
         if not uploaded.ok() {
             return uploaded
         }
@@ -251,11 +247,11 @@ class BucketStorage {
     }
 }
 
-# server.useStorage(BucketStorage(S3Client.fromEnv()))
+server.use(BucketStorage(S3Client.fromEnv()))
 ```
 
-Attach a backend with `server.useStorage(backend)` or
-`handlers.useStorage(backend)`. `useStorage` is implemented in Lammergeier by
+Attach a partial storage provider with `server.use(storage)` or
+`handlers.use(storage)`. `use` is implemented in Lammergeier by
 binding the storage object's methods as ordinary callbacks. A callback
 registered later with `onRead`, `onWrite`, `onList`, or `onCommand` overrides
 the corresponding interface method.
@@ -268,11 +264,12 @@ basic `SftpStorage`, random-access `SftpStreamingStorage`, and
 server.useBackend(MyBackend())
 ```
 
-`useBackend` validates the structural interface at runtime because current
-`lamc` versions incorrectly lower imported interface annotations to pointers to
-Go interfaces when one class is explicitly assigned to several imported
-interfaces. Individual typed `useStorage`, `useStreamingStorage`, and
-`useProtocolStorage` methods remain available.
+`use` is an overload set for the disjoint `SftpStorage`,
+`SftpStreamingStorage`, and `SftpProtocolStorage` roles. Lam 1.18 checks each
+structural contract at compile time, so invalid providers no longer reach a
+runtime type assertion. Use the separately typed `useBackend` method for a
+complete `SftpBackend`; keeping the aggregate distinct avoids ambiguous overload
+selection because a backend also satisfies the three narrower interfaces.
 
 ## Authentication and session metadata
 
@@ -416,22 +413,22 @@ server.onCommandMethod("Setstat", lambda (req: SftpRequest) -> Result[bool]: app
 | `key()` | Path without the leading `/`, convenient for object stores. |
 | `basename()` | Last path segment. |
 | `sessionValue(key, fallback="")` | Safe session metadata lookup. |
-| `context()` | Public `lamcontext.Context` wrapping the protocol request's native Go context. |
+| `context()` | `Result[Context]` wrapping the protocol request's native Go context. |
 | `isReadOperation()`, `isWriteOperation()`, `isListOperation()`, `isCommandOperation()` | Operation classification helpers. |
-| `cancelled()` | Whether `context().expired()` reports cancellation by disconnect/completion. |
-| `deadlineUnix()` | `context()` deadline in Unix seconds, or `0` when none is set. |
+| `cancelled()` | `Result[bool]` reporting cancellation by disconnect/completion. |
+| `deadlineUnix()` | `Result[int]` containing the context deadline in Unix seconds, or `0` when none is set. |
 
-Use `context()` directly for Lam 1.16 cancellation trees, expiration inspection,
-bounded waits, reasons, and values. `cancelled()` and `deadlineUnix()` remain as
-compatibility conveniences and are implemented through the same wrapper. A
-manually constructed request receives a live simple context; adapter-built
-requests wrap `github.com/pkg/sftp`'s native request context.
+Use `context()` directly for Lam 1.18 cancellation trees, expiration inspection,
+bounded waits, reasons, and values. `context()`, `cancelled()`, and
+`deadlineUnix()` preserve native-context and duration failures as `Result`
+values. A manually constructed request receives a live simple context;
+adapter-built requests wrap `github.com/pkg/sftp`'s native request context.
 
 ```lammergeier
-requestContext: Context = request.context()
+requestContext: Context = request.context()?
 closed: bool = requestContext.expired()
-absoluteExpiryMs: int = requestContext.expiresIn(None)
-remainingMs: int = requestContext.expiresIn("milliseconds")
+absoluteExpiryMs: int = requestContext.expiresIn(None)?
+remainingMs: int = requestContext.expiresIn("milliseconds")?
 ```
 
 `expiresIn(None)` returns the absolute Unix-millisecond expiry. Supplying a unit
@@ -532,23 +529,17 @@ server.onListen(lambda (srv: SftpServer): print(f"listening on {srv.boundAddress
 server.onClose(lambda (_srv: SftpServer): print("SFTP closed"))
 server.onError(lambda (error: any): print(f"SFTP error: {error}"))
 
-do {
-    server.tryListenBackground()?
-    print(server.activeConnections())
-    # application work
-} catch err {
-    print(f"SFTP startup failed: {err}")
-}
+_ = server.listenBackground()?
+print(server.activeConnections())
+# application work
 
 server.shutdown()
 print(server.isListening())
 ```
 
-- `listen()` blocks until the server closes and panics on startup failure.
-- `tryListen()` is the blocking `Result`-returning variant.
-- `listenBackground()` uses a Lammergeier `async func` and returns immediately
-  with a success boolean.
-- `tryListenBackground()` returns `Result[bool]` with startup details.
+- `listen()` blocks until the server closes and returns `Result[bool]`.
+- `listenBackground()` starts the Lammergeier `async func` and returns
+  `Result[bool]` immediately with startup details.
 - `close()` is idempotent and asks the listener and active connections to
   close without waiting, so it is safe from lifecycle callbacks.
 - `wait()` blocks until a background listener and its `onClose` callbacks
@@ -564,7 +555,7 @@ there instead.
 
 ## Testing
 
-The tests require `lamc >=1.16.0`, stage the sibling checkouts as
+The tests require `lamc >=1.18.0`, stage the sibling checkouts as
 `extlibs/@lam/sftp` and `extlibs/@lam/ssh`, compile through public scoped
 imports, assert the `lamcontext.Context` and SSH-backed host-key integration,
 and preserve the SSH/SFTP round trip against a callback-backed in-memory store:

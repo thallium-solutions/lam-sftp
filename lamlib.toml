@@ -1,6 +1,6 @@
 [library]
 name = "@lam/sftp"
-version = "1.0.0"
+version = "2.0.0"
 description = "Callback-driven, storage-agnostic SFTP server for Lammergeier"
 license = "Apache-2.0"
 authors = ["Lammergeier contributors"]
@@ -8,10 +8,10 @@ repository = "https://github.com/thallium-solutions/lam-sftp"
 homepage = "https://github.com/thallium-solutions/lam-sftp"
 
 [compatibility]
-lamc = "^1.16"
+lamc = "^1.18"
 
 [dependencies]
-"@lam/ssh" = { git = "https://github.com/thallium-solutions/lam-ssh.git", ref = "v1.0.0" }
+"@lam/ssh" = { git = "https://github.com/thallium-solutions/lam-ssh.git", ref = "v2.0.0" }
 
 [go-deps]
 "github.com/pkg/sftp" = "v1.13.11"

@@ -7,6 +7,7 @@ from lamlog import Log
 from lamratelimit import TokenBucket
 from lamtime import Time
 from .models import SftpAuth, SftpFile, SftpRequest, SftpStatVFS
+from .interfaces import SftpBackend, SftpProtocolStorage, SftpStorage, SftpStreamingStorage
 from .metrics import SftpMetrics
 from .handlers import SftpHandlers
 from .config import SftpConfig
@@ -25,11 +26,11 @@ go! {
 }
 
 class SftpServer {
-    func __init__(self, config: SftpConfig, handlers: SftpHandlers = SftpHandlers()) {
+    func init(self, config: SftpConfig, handlers: SftpHandlers = SftpHandlers()) {
         _ = sftpAdapterLoaded()
         self.config: SftpConfig = config
         self.handlers: SftpHandlers = handlers
-        self.metrics: SftpMetrics = None
+        self.metrics: SftpMetrics = handlers.metrics
         burst: int = config.authBurst
         rate: int = config.authAttemptsPerSecond
         if burst < 1 {
@@ -52,16 +53,13 @@ class SftpServer {
         self._raw: any = None
         self._stateMu: RWMutex = RWMutex()
         self._serveTask: any = None
-        go! {
-            s.Metrics = handlers.Metrics
-        }
     }
 
     func allowAuthAttempt(self) -> bool {
         if self.config.authAttemptsPerSecond == 0 {
             return true
         }
-        return self.authLimiter.tryTake(1)
+        return self.authLimiter.takeAvailable(1)
     }
 
     func uptimeSeconds(self) -> int {
@@ -222,23 +220,38 @@ class SftpServer {
         return self
     }
 
-    func useStorage(self, storage: any) -> SftpServer {
+    func use(self, storage: SftpStorage) -> SftpServer {
+        self.handlers.use(storage)
+        return self
+    }
+
+    func use(self, storage: SftpStreamingStorage) -> SftpServer {
+        self.handlers.use(storage)
+        return self
+    }
+
+    func use(self, storage: SftpProtocolStorage) -> SftpServer {
+        self.handlers.use(storage)
+        return self
+    }
+
+    func useStorage(self, storage: SftpStorage) -> SftpServer {
         self.handlers.useStorage(storage)
         return self
     }
 
-    func useBackend(self, storage: any) -> SftpServer {
-        self.handlers.useBackend(storage)
-        return self
-    }
-
-    func useStreamingStorage(self, storage: any) -> SftpServer {
+    func useStreamingStorage(self, storage: SftpStreamingStorage) -> SftpServer {
         self.handlers.useStreamingStorage(storage)
         return self
     }
 
-    func useProtocolStorage(self, storage: any) -> SftpServer {
+    func useProtocolStorage(self, storage: SftpProtocolStorage) -> SftpServer {
         self.handlers.useProtocolStorage(storage)
+        return self
+    }
+
+    func useBackend(self, storage: SftpBackend) -> SftpServer {
+        self.handlers.useBackend(storage)
         return self
     }
 
@@ -437,7 +450,7 @@ class SftpServer {
         return result
     }
 
-    func tryListen(self) -> Result[bool] {
+    func listen(self) -> Result[bool] {
         ready: Result = self._validateStart()
         if not ready.ok() {
             self._notifyError(ready.error)
@@ -454,11 +467,7 @@ class SftpServer {
         return self._serve(started.value)
     }
 
-    func listen(self) {
-        _ = self.tryListen().unwrap()
-    }
-
-    func tryListenBackground(self) -> Result[bool] {
+    func listenBackground(self) -> Result[bool] {
         ready: Result = self._validateStart()
         if not ready.ok() {
             self._notifyError(ready.error)
@@ -474,10 +483,6 @@ class SftpServer {
         self._runLifecycle(self.listenCallbacks)
         self._serveTask = _serveSftp(self, started.value)
         return Result.Ok(true)
-    }
-
-    func listenBackground(self) -> bool {
-        return self.tryListenBackground().ok()
     }
 
     func close(self) {

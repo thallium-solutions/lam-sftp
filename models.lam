@@ -5,7 +5,7 @@ from lamcontext import Context
 from lamerrors import Result, Error
 
 class SftpExtended {
-    func __init__(self, name: str, data: str) {
+    func init(self, name: str, data: str) {
         self.name: str = name
         self.data: str = data
     }
@@ -50,7 +50,7 @@ class SftpErrors {
 }
 
 class SftpAuth {
-    func __init__(self) {
+    func init(self) {
         self.username: str = ""
         self.remoteAddress: str = ""
         self.method: str = ""
@@ -74,7 +74,7 @@ class SftpAuth {
 }
 
 class SftpRequest {
-    func __init__(self) {
+    func init(self) {
         self.method: str = ""
         self.path: str = ""
         self.target: str = ""
@@ -128,23 +128,25 @@ class SftpRequest {
         return fallback
     }
 
-    func context(self) -> Context {
+    func context(self) -> Result[Context] {
         if self._context == None {
-            return Context.simple()
+            return Result.Ok(Context.simple())
         }
         return Context.fromNative(self._context)
     }
 
-    func cancelled(self) -> bool {
-        return self.context().expired()
+    func cancelled(self) -> Result[bool] {
+        requestContext: Context = self.context()?
+        return Result.Ok(requestContext.expired())
     }
 
-    func deadlineUnix(self) -> int {
-        deadlineMs: int = self.context().expiresIn(None)
+    func deadlineUnix(self) -> Result[int] {
+        requestContext: Context = self.context()?
+        deadlineMs: int = requestContext.expiresIn(None)?
         if deadlineMs < 0 {
-            return 0
+            return Result.Ok(0)
         }
-        return deadlineMs / 1000
+        return Result.Ok(deadlineMs / 1000)
     }
 
     func isReadOperation(self) -> bool {
@@ -165,7 +167,7 @@ class SftpRequest {
 }
 
 class SftpFile {
-    func __init__(self, name: str, size: int = 0, kind: str = "file", permissions: int = 420, modifiedUnix: int = 0, path: str = "", target: str = "", uid: int = 0, gid: int = 0, extended: list[SftpExtended] = []) {
+    func init(self, name: str, size: int = 0, kind: str = "file", permissions: int = 420, modifiedUnix: int = 0, path: str = "", target: str = "", uid: int = 0, gid: int = 0, extended: list[SftpExtended] = []) {
         self.name: str = name
         self.path: str = path
         self.size: int = size
@@ -228,7 +230,7 @@ class SftpFile {
 }
 
 class SftpStatVFS {
-    func __init__(self, blockSize: int = 4096, fragmentSize: int = 4096, blocks: int = 0, blocksFree: int = 0, blocksAvailable: int = 0, files: int = 0, filesFree: int = 0, filesAvailable: int = 0, filesystemId: int = 0, flags: int = 0, nameMax: int = 255) {
+    func init(self, blockSize: int = 4096, fragmentSize: int = 4096, blocks: int = 0, blocksFree: int = 0, blocksAvailable: int = 0, files: int = 0, filesFree: int = 0, filesAvailable: int = 0, filesystemId: int = 0, flags: int = 0, nameMax: int = 255) {
         self.blockSize: int = blockSize
         self.fragmentSize: int = fragmentSize
         self.blocks: int = blocks

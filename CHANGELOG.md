@@ -2,18 +2,26 @@
 
 All notable changes to `@lam/sftp` are documented here.
 
-## Unreleased - 2026-09-13
+## 2.0.0 - 2026-09-30
 
 ### Added
 
-- Public `SftpRequest.context() -> lamcontext.Context` access for direct Lam
-  cancellation, expiration, wait, reason, value, and native-interop APIs.
+- Public `SftpRequest.context() -> Result[lamcontext.Context]` access for direct
+  Lam cancellation, expiration, wait, reason, value, and native-interop APIs.
 - Consumer tests that stage both `@lam/sftp` and local `@lam/ssh`, assert the
   SSH-backed Ed25519 host-key format, and exercise the request context wrapper.
 
 ### Changed
 
-- Raised compiler compatibility to Lam 1.16 and declared `@lam/ssh` v1.0.0 as
+- Replaced `tryListen`/throwing `listen` and `tryListenBackground`/boolean
+  `listenBackground` twins with unsuffixed `Result[bool]` lifecycle APIs.
+- Consolidated partial storage registration into compile-time checked `use`
+  overloads and explicit typed `useStorage`, `useStreamingStorage`, and
+  `useProtocolStorage` installers; retained a typed `useBackend` aggregate while
+  removing runtime assertions and `go!` bridges.
+- Migrated class constructors from `__init__` to `init`, file reads to
+  `Os.readFile`, and request-context helpers to propagated `Result` values.
+- Raised compiler compatibility to Lam 1.18 and declared `@lam/ssh` v2.0.0 as
   a pinned Git dependency after validating the sibling-checkout development flow.
 - Delegated `SftpKey.generate()` to `SshKeyPair.generateHostEd25519`; it now
   returns `privateKeyPem`, moving secure key generation into the shared
@@ -25,7 +33,12 @@ All notable changes to `@lam/sftp` are documented here.
 - Retained the established SSH server transport in `server.lam` and
   `_adapter.lam` to avoid destabilizing the protocol engine, and refreshed the
   requirements, architecture, package layout, installation, examples, and
-  testing documentation for Lam 1.16.
+  testing documentation for Lam 1.18.
+
+### Testing
+
+- Added an installed-package SSH/SFTP loopback covering explicit typed storage
+  installers, auth paths, request context, lifecycle hooks, failures, and metrics.
 
 ## 1.0.0 - 2026-09-12
 

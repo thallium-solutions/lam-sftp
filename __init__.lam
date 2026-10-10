@@ -13,5 +13,5 @@ from .config import SftpConfig, SftpKey
 from .server import SftpServer
 
 func tag() -> str {
-    return "@lam/sftp@1.0.0"
+    return "@lam/sftp@2.0.0"
 }

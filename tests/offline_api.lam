@@ -1,4 +1,4 @@
-# expect: @lam/sftp@1.0.0
+# expect: @lam/sftp@2.0.0
 # expect: false
 # expect: true
 # expect: true
@@ -59,7 +59,7 @@ func main() {
     print(not SftpErrors.notFound("/missing").ok())
     print(not SftpErrors.permissionDenied("/private").ok())
 
-    handlers: SftpHandlers = SftpHandlers().useStorage(DemoStorage())
+    handlers: SftpHandlers = SftpHandlers().use(DemoStorage())
     server: SftpServer = SftpServer(valid, handlers)
-    print(not server.tryListenBackground().ok())
+    print(not server.listenBackground().ok())
 }

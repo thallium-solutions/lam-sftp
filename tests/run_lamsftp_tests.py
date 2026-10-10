@@ -15,7 +15,7 @@ from pathlib import Path
 LIB_ROOT = Path(__file__).resolve().parents[1]
 SSH_LIB_ROOT = LIB_ROOT.parent / "lam-ssh"
 COMPILER = "lamc"
-MIN_COMPILER_VERSION = (1, 16, 0)
+MIN_COMPILER_VERSION = (1, 18, 0)
 PACKAGE_PATH = Path("@lam") / "sftp"
 SSH_PACKAGE_PATH = Path("@lam") / "ssh"
 
@@ -36,9 +36,13 @@ def _check_compiler() -> bool:
         print(f"Error: invalid {COMPILER} version: {proc.stdout.strip()!r}", file=sys.stderr)
         return False
     version = tuple(int(part) for part in match.groups())
-    if version < MIN_COMPILER_VERSION:
+    if version < MIN_COMPILER_VERSION or version[0] != MIN_COMPILER_VERSION[0]:
         required = ".".join(str(part) for part in MIN_COMPILER_VERSION)
-        print(f"Error: {COMPILER} {proc.stdout.strip()} is incompatible; >= {required} is required.", file=sys.stderr)
+        print(
+            f"Error: {COMPILER} {proc.stdout.strip()} is incompatible; "
+            f">= {required} and < 2.0.0 is required.",
+            file=sys.stderr,
+        )
         return False
     return True
 
