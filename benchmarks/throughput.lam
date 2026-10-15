@@ -1,0 +1,230 @@
+# @lam/sftp throughput benchmark.
+#
+# Starts an in-process SFTP server whose byte-slice callbacks discard uploads
+# and serve zero-filled downloads, then drives it with 1..N concurrent SSH
+# sessions (pkg/sftp client, concurrent requests) over loopback and reports
+# aggregate MB/s per direction.
+#
+# Environment:
+#   BENCH_MB        payload per session and direction (default 256)
+#   BENCH_FLOWS     comma-separated session counts (default 1,2,4,8)
+#   BENCH_CIPHER    client cipher (e.g. aes128-gcm@openssh.com, chacha20-poly1305@openssh.com)
+#   BENCH_FAST_CIPHERS=1  server offers only SftpConfig.fastCiphers()
+#   BENCH_PROFILE   write a CPU profile of the whole run to this path
+#   BENCH_SERVE     only serve on this address (e.g. 127.0.0.1:2222) for external
+#                   clients such as OpenSSH sftp; user "bench" with password
+#                   "bench" or any public key
+#   BENCH_CONNECT   only run the clients against this address (pair with
+#                   BENCH_SERVE in another process, e.g. pinned with taskset)
+#
+# Build and run:  lamc benchmarks/throughput.lam --extlibs <dir containing @lam/sftp, @lam/ssh> -o /tmp/sftpbench && /tmp/sftpbench
+
+from @lam/sftp import SftpAuth, SftpConfig, SftpFile, SftpKey, SftpRequest, SftpServer
+from lamerrors import Result
+
+go! {
+    import (
+        "bytes"
+        "fmt"
+        "io"
+        "os"
+        "runtime/pprof"
+        "strconv"
+        "sync"
+        "time"
+
+        clientsftp "github.com/pkg/sftp"
+        "golang.org/x/crypto/ssh"
+    )
+
+    var benchZeros = make([]byte, 1<<20)
+
+    func benchEnvInt(name string, fallback int) int {
+        if value, err := strconv.Atoi(os.Getenv(name)); err == nil && value > 0 {
+            return value
+        }
+        return fallback
+    }
+
+    // benchTransfer moves ``size`` bytes per session over ``flows`` concurrent
+    // SSH sessions and returns the aggregate MB/s plus the slowest and fastest
+    // session's MB/s (fairness between concurrent flows).
+    func benchTransfer(address string, flows int, size int, upload bool, payload []byte) (float64, float64, float64) {
+        cfg := &ssh.ClientConfig{User: "bench", Auth: []ssh.AuthMethod{ssh.Password("bench")}, HostKeyCallback: ssh.InsecureIgnoreHostKey()}
+        if cipher := os.Getenv("BENCH_CIPHER"); cipher != "" {
+            cfg.Config.Ciphers = []string{cipher}
+        }
+        var wg sync.WaitGroup
+        errs := make(chan error, flows)
+        rates := make([]float64, flows)
+        start := time.Now()
+        for i := 0; i < flows; i++ {
+            wg.Add(1)
+            go func(i int) {
+                defer wg.Done()
+                began := time.Now()
+                errs <- benchSession(address, cfg, fmt.Sprintf("/bench-%d.bin", i), size, upload, payload)
+                rates[i] = float64(size) / 1048576 / time.Since(began).Seconds()
+            }(i)
+        }
+        wg.Wait()
+        elapsed := time.Since(start).Seconds()
+        close(errs)
+        for err := range errs {
+            if err != nil {
+                panic(err)
+            }
+        }
+        lo, hi := rates[0], rates[0]
+        for _, r := range rates {
+            if r < lo {
+                lo = r
+            }
+            if r > hi {
+                hi = r
+            }
+        }
+        return float64(size*flows) / 1048576 / elapsed, lo, hi
+    }
+
+    func benchSession(address string, cfg *ssh.ClientConfig, name string, size int, upload bool, payload []byte) error {
+        conn, err := ssh.Dial("tcp", address, cfg)
+        if err != nil {
+            return err
+        }
+        defer conn.Close()
+        client, err := clientsftp.NewClient(conn, clientsftp.UseConcurrentWrites(true), clientsftp.UseConcurrentReads(true))
+        if err != nil {
+            return err
+        }
+        defer client.Close()
+        if upload {
+            f, err := client.Create(name)
+            if err != nil {
+                return err
+            }
+            if _, err = f.ReadFrom(bytes.NewReader(payload)); err != nil {
+                return err
+            }
+            return f.Close()
+        }
+        f, err := client.Open(name)
+        if err != nil {
+            return err
+        }
+        defer f.Close()
+        n, err := f.WriteTo(io.Discard)
+        if err == nil && n != int64(size) {
+            err = fmt.Errorf("short download: %d of %d", n, size)
+        }
+        return err
+    }
+}
+
+func sizeBytes() -> int {
+    return go!(benchEnvInt("BENCH_MB", 256)) * 1048576
+}
+
+func discard(_request: SftpRequest, data: bytes, _offset: int) -> Result[int] {
+    return Result.Ok(len(data))
+}
+
+func zeros(_request: SftpRequest, offset: int, length: int) -> Result[bytes] {
+    size: int = sizeBytes()
+    out: bytes = go!([]byte{})
+    go! {
+        remaining := size - offset
+        if remaining > 0 {
+            if length > remaining {
+                length = remaining
+            }
+            if length > len(benchZeros) {
+                length = len(benchZeros)
+            }
+            out = benchZeros[:length]
+        }
+    }
+    return Result.Ok(out)
+}
+
+func stat(request: SftpRequest) -> Result[list[SftpFile]] {
+    out: list[SftpFile] = [SftpFile(request.path, sizeBytes())]
+    return Result.Ok(out)
+}
+
+func allow(auth: SftpAuth) -> bool {
+    return auth.username == "bench"
+}
+
+func startServer(address: str) -> Result[SftpServer] {
+    config: SftpConfig = SftpConfig(SftpKey.generate()?, address)
+    config.maxReadBytes = 0
+    config.maxWriteBytes = 0
+    config = config.withConnectionLimit(512).withAuthRateLimit(0, 1)
+    if go!(os.Getenv("BENCH_FAST_CIPHERS")) == "1" {
+        config = config.withCiphers(SftpConfig.fastCiphers())
+    }
+    server: SftpServer = SftpServer(config)
+    _ = server.onPasswordAuth(allow)
+    _ = server.onPublicKeyAuth(allow)
+    _ = server.onWriteAtBytes(discard)
+    _ = server.onReadAtBytes(zeros)
+    _ = server.onList(stat)
+    _ = server.listenBackground()?
+    return Result.Ok(server)
+}
+
+func main() {
+    serveAddr: str = go!(os.Getenv("BENCH_SERVE"))
+    if serveAddr != "" {
+        serving: SftpServer = startServer(serveAddr).unwrap()
+        print(f"serving on {serving.boundAddress} (user bench / password bench); Ctrl+C to stop")
+        go! {
+            if path := os.Getenv("BENCH_PROFILE"); path != "" {
+                f, err := os.Create(path)
+                if err != nil {
+                    panic(err)
+                }
+                _ = pprof.StartCPUProfile(f)
+                seconds := benchEnvInt("BENCH_PROFILE_SECONDS", 30)
+                time.Sleep(time.Duration(seconds) * time.Second)
+                pprof.StopCPUProfile()
+                _ = f.Close()
+            }
+            select {}
+        }
+    }
+    target: str = go!(os.Getenv("BENCH_CONNECT"))
+    server: SftpServer = SftpServer(SftpConfig())
+    if target == "" {
+        server = startServer("127.0.0.1:0").unwrap()
+        target = server.boundAddress
+    }
+    flowsText: str = go!(os.Getenv("BENCH_FLOWS"))
+    if flowsText == "" {
+        flowsText = "1,2,4,8"
+    }
+    size: int = sizeBytes()
+    print(f"payload {size / 1048576} MiB per session and direction")
+    go! {
+        if path := os.Getenv("BENCH_PROFILE"); path != "" {
+            f, err := os.Create(path)
+            if err != nil {
+                panic(err)
+            }
+            _ = pprof.StartCPUProfile(f)
+            defer func() { pprof.StopCPUProfile(); _ = f.Close() }()
+        }
+        payload := bytes.Repeat([]byte{0x5a}, size)
+        for _, part := range bytes.Split([]byte(flowsText), []byte(",")) {
+            flows, _ := strconv.Atoi(string(bytes.TrimSpace(part)))
+            up, upLo, upHi := benchTransfer(target, flows, size, true, payload)
+            down, downLo, downHi := benchTransfer(target, flows, size, false, payload)
+            fmt.Printf("flows=%-3d upload %6.0f MB/s (per flow %4.0f..%4.0f)   download %6.0f MB/s (per flow %4.0f..%4.0f)\n",
+                flows, up, upLo, upHi, down, downLo, downHi)
+        }
+    }
+    if server.isListening() {
+        server.shutdown()
+    }
+}

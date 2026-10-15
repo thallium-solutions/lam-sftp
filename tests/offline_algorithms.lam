@@ -1,0 +1,105 @@
+# SSH algorithm configuration: ``withCiphers`` / ``withKeyExchanges`` /
+# ``withMacs`` restrict what the server offers (clients pick their first
+# match), names are validated, and ``SftpConfig.fastCiphers()`` excludes
+# ChaCha20 so OpenSSH clients negotiate hardware-accelerated AES-GCM.
+#
+# expect: default-config-valid=true
+# expect: fast-has-gcm=true
+# expect: fast-excludes-chacha=true
+# expect: unknown-cipher=SftpConfigError: unsupported SSH cipher "rot13"
+# expect: unknown-kex=SftpConfigError: unsupported SSH key exchange "dh-none"
+# expect: unknown-mac=SftpConfigError: unsupported SSH MAC "crc32"
+# expect: gcm-client=ok
+# expect: chacha-only-client=rejected
+# expect: kex-restricted=ok
+
+from @lam/sftp import SftpAuth, SftpConfig, SftpKey, SftpRequest, SftpServer
+from lamerrors import Result, Error
+
+go! {
+    import (
+        "net"
+
+        "golang.org/x/crypto/ssh"
+    )
+
+    func algoDial(address string, ciphers []string, kex []string) (string, error) {
+        cfg := &ssh.ClientConfig{
+            User:            "u",
+            Auth:            []ssh.AuthMethod{ssh.Password("x")},
+            HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+        }
+        cfg.Config.Ciphers = ciphers
+        cfg.Config.KeyExchanges = kex
+        raw, err := net.Dial("tcp", address)
+        if err != nil {
+            return "", err
+        }
+        conn, chans, reqs, err := ssh.NewClientConn(raw, address, cfg)
+        if err != nil {
+            raw.Close()
+            return "", err
+        }
+        client := ssh.NewClient(conn, chans, reqs)
+        defer client.Close()
+        return "ok", nil
+    }
+}
+
+func allowAll(_auth: SftpAuth) -> bool {
+    return true
+}
+
+func configError(cfg: SftpConfig) -> str {
+    checked: Result[bool] = cfg.validate()
+    if checked.ok() {
+        return "valid"
+    }
+    err: Error = checked.error
+    return f"{err.kind}: {err.message}"
+}
+
+func run() -> Result[bool] {
+    key: str = SftpKey.generate()?
+    plain: SftpConfig = SftpConfig(key, "127.0.0.1:0")
+    print(f"default-config-valid={plain.validate().ok()}")
+    fast: list[str] = SftpConfig.fastCiphers()
+    print(f"fast-has-gcm={'aes128-gcm@openssh.com' in fast and 'aes256-gcm@openssh.com' in fast}")
+    print(f"fast-excludes-chacha={'chacha20-poly1305@openssh.com' not in fast}")
+    print("unknown-cipher=" + configError(SftpConfig(key, "127.0.0.1:0").withCiphers(["aes128-gcm@openssh.com", "rot13"])))
+    print("unknown-kex=" + configError(SftpConfig(key, "127.0.0.1:0").withKeyExchanges(["dh-none"])))
+    print("unknown-mac=" + configError(SftpConfig(key, "127.0.0.1:0").withMacs(["crc32"])))
+
+    server: SftpServer = SftpServer(SftpConfig(key, "127.0.0.1:0").withCiphers(fast).withKeyExchanges(["curve25519-sha256"]))
+    _ = server.onPasswordAuth(allowAll)
+    _ = server.listenBackground()?
+    gcm: str = ""
+    chacha: str = ""
+    kexOk: str = ""
+    go! {
+        if out, err := algoDial(server.BoundAddress, []string{"chacha20-poly1305@openssh.com", "aes128-gcm@openssh.com"}, nil); err == nil {
+            gcm = out
+        } else {
+            gcm = err.Error()
+        }
+        if _, err := algoDial(server.BoundAddress, []string{"chacha20-poly1305@openssh.com"}, nil); err != nil {
+            chacha = "rejected"
+        } else {
+            chacha = "accepted"
+        }
+        if out, err := algoDial(server.BoundAddress, []string{"aes128-gcm@openssh.com"}, []string{"curve25519-sha256"}); err == nil {
+            kexOk = out
+        } else {
+            kexOk = err.Error()
+        }
+    }
+    print("gcm-client=" + gcm)
+    print("chacha-only-client=" + chacha)
+    print("kex-restricted=" + kexOk)
+    server.shutdown()
+    return Result.Ok(true)
+}
+
+func main() {
+    _ = run().unwrap()
+}

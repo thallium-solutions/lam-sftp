@@ -15,6 +15,8 @@ reach.
 - Lammergeier functions and lambdas for password auth, public-key auth, reads,
   writes, directory listings, metadata lookups, and filesystem commands.
 - A structural `SftpStorage` interface for class-based backends.
+- Zero-conversion byte-slice streaming (`onReadAtBytes`/`onWriteAtBytes`,
+  `SftpByteStreamingStorage`) for high-throughput storage backends.
 - Standard `lamerrors.Result` and `Error` values for expected failures.
 - Protocol-aware `SftpErrors` helpers for not-found, permission, conflict,
   invalid-request, and unsupported-operation responses.
@@ -52,7 +54,7 @@ facilities. `github.com/pkg/sftp v1.13.11` remains a direct Go pin;
 
 ```text
 lam-sftp/
-├── __init__.lam       # public re-exports and tag()
+├── __init__.lam       # public re-exports
 ├── models.lam         # requests/lamcontext, files, auth, errors, StatVFS
 ├── interfaces.lam     # storage and backend contracts
 ├── metrics.lam        # Atomic-backed operational counters
@@ -256,6 +258,9 @@ binding the storage object's methods as ordinary callbacks. A callback
 registered later with `onRead`, `onWrite`, `onList`, or `onCommand` overrides
 the corresponding interface method.
 
+`useByteStreamingStorage` installs a `SftpByteStreamingStorage`; it is a
+separately named method because a class may satisfy both streaming interfaces.
+
 For the complete production surface, implement `SftpBackend`. It combines the
 basic `SftpStorage`, random-access `SftpStreamingStorage`, and
 `SftpProtocolStorage` contracts. Attach it once with:
@@ -352,6 +357,41 @@ mode, while SFTP packet size bounds individual streaming calls. Read-write
 `Open` requires both `onReadAt` and `onWriteAt`; configuring only one returns
 `SSH_FX_OP_UNSUPPORTED`. A short successful `writeAt` is rejected because
 `github.com/pkg/sftp` otherwise reports the entire packet as written.
+
+#### Byte-slice streaming
+
+`onReadAt`/`onWriteAt` exchange `list[int]`, which costs a per-byte conversion
+of every packet. High-throughput backends (object storage gateways, proxies)
+should use the `bytes` variants instead; the packet payload is handed over
+as-is:
+
+| Registration | Purpose |
+|---|---|
+| `onReadAtBytes(req, offset, length) -> Result[bytes]` | Same contract as `onReadAt`, returning a byte slice. |
+| `onWriteAtBytes(req, data: bytes, offset) -> Result[int]` | Same contract as `onWriteAt`, receiving the payload slice. |
+| `useByteStreamingStorage(storage)` | Installs a `SftpByteStreamingStorage` (`readAtBytes`, `writeAtBytes`, `closeRead`, `closeWrite`). |
+
+Byte callbacks take precedence over the `list[int]` ones when both are
+registered, and guards, read-only mode, metrics and transfer-error hooks apply
+unchanged. The `data` slice passed to `writeAtBytes` is only valid during the
+call: copy it (for example by appending it to your own buffer) if it must
+outlive the callback. On a 256 MiB loopback upload the byte path measured
+~800 MiB/s versus ~640 MiB/s for `list[int]`, with no per-packet `[]int`
+allocation.
+
+```lammergeier
+from @lam/sftp import SftpRequest, SftpServer
+from lamerrors import Result
+
+func forward(request: SftpRequest, data: bytes, offset: int) -> Result[int] {
+    # hand `data` to a writer that copies it, e.g. an S3 multipart buffer
+    return Result.Ok(len(data))
+}
+
+func install(server: SftpServer) {
+    _ = server.onWriteAtBytes(forward)
+}
+```
 
 ### Protocol metadata and extensions
 
@@ -481,7 +521,10 @@ start without bounded reads/writes, idle and authentication limits, and
 
 - `maxConnections` bounds accepted TCP/SSH connections.
 - `handshakeTimeoutMs` limits clients that connect without completing SSH.
-- `idleTimeoutMs` is refreshed on every network read/write.
+- `idleTimeoutMs` closes a connection after that long without network
+  activity (the socket deadline is re-armed lazily, so an idle connection
+  closes between `idleTimeoutMs - min(idleTimeoutMs/10, 1s)` and
+  `idleTimeoutMs` after its last read or write).
 - `maxAuthTries` is passed to `ssh.ServerConfig`.
 - `authAttemptsPerSecond` and `authBurst` use the stdlib `TokenBucket` to bound
   aggregate authentication work. Set the rate to `0` only outside production.
@@ -500,6 +543,49 @@ metrics: dict[str, int] = server.metricsSnapshot()
 print(metrics["connectionsAccepted"])
 print(metrics["bytesWritten"])
 print(server.uptimeSeconds())
+```
+
+## Performance and SSH algorithms
+
+The per-packet path is allocation-light: byte callbacks receive the payload
+slice directly, packet buffers are reused across requests
+(`withBufferReuse(false)` turns this off if a callback must keep `data`
+after returning), and idle deadlines are re-armed lazily.
+
+The cipher dominates the remaining cost. OpenSSH clients prefer
+ChaCha20-Poly1305, which is about half as fast as AES-GCM on CPUs with AES-NI.
+The server cannot reorder a client's preferences, but it decides what it
+offers:
+
+```lammergeier
+config = config.withCiphers(SftpConfig.fastCiphers())   # AES-GCM only
+config = config.withKeyExchanges(["curve25519-sha256", "curve25519-sha256@libssh.org"])
+config = config.withMacs(["hmac-sha2-256-etm@openssh.com"])  # unused by AEAD ciphers
+```
+
+Names are validated against the SSH library (`SftpConfigError` for unknown
+ones); empty lists keep the library's secure defaults.
+
+Measured on an Intel i9-13900HX over loopback (server on 16 threads, clients
+on the other 16; `benchmarks/throughput.lam` and OpenSSH 8.9 `sftp` with its
+default settings, 1 GiB per session):
+
+| Clients | Default ciphers | `fastCiphers()` |
+|---|---|---|
+| 1 OpenSSH session | 443 / 445 MB/s | 881 / 1117 MB/s (upload / download) |
+| 4 sessions | 1358 / 1387 MB/s | 2550 / 3388 MB/s |
+| 8 sessions | 2037 / 2177 MB/s | 3754 / 4777 MB/s |
+| 16 sessions | | 4200 / 4548 MB/s |
+
+Concurrent sessions share bandwidth evenly (at 32 sessions every flow stayed
+within 80–97 MB/s). A single session already exceeds a 5 GbE link (about
+590 MB/s of payload), so the network is the limit in practice. Run the
+benchmark yourself:
+
+```bash
+lamc benchmarks/throughput.lam --extlibs <dir with @lam/sftp and @lam/ssh> -o /tmp/sftpbench
+BENCH_MB=256 BENCH_FLOWS=1,4,8,16 /tmp/sftpbench
+BENCH_SERVE=127.0.0.1:2222 BENCH_FAST_CIPHERS=1 /tmp/sftpbench   # for external clients
 ```
 
 ## Errors

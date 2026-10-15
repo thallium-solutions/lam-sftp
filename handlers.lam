@@ -3,7 +3,7 @@
 
 from lamerrors import Result
 from .models import SftpErrors, SftpFile, SftpRequest, SftpStatVFS
-from .interfaces import SftpBackend, SftpProtocolStorage, SftpStorage, SftpStreamingStorage
+from .interfaces import SftpBackend, SftpByteStreamingStorage, SftpProtocolStorage, SftpStorage, SftpStreamingStorage
 from .metrics import SftpMetrics
 
 class SftpHandlers {
@@ -31,6 +31,8 @@ class SftpHandlers {
         self.groupCallback: func(str) -> str = lambda(value: str) -> str: value
         self.readAtCallback: func(SftpRequest, int, int) -> Result[list[int]] = lambda(_request: SftpRequest, _offset: int, _length: int) -> Result[list[int]]: SftpErrors.unsupported("readAt")
         self.writeAtCallback: func(SftpRequest, list[int], int) -> Result[int] = lambda(_request: SftpRequest, _data: list[int], _offset: int) -> Result[int]: SftpErrors.unsupported("writeAt")
+        self.readAtBytesCallback: func(SftpRequest, int, int) -> Result[bytes] = lambda(_request: SftpRequest, _offset: int, _length: int) -> Result[bytes]: SftpErrors.unsupported("readAtBytes")
+        self.writeAtBytesCallback: func(SftpRequest, bytes, int) -> Result[int] = lambda(_request: SftpRequest, _data: bytes, _offset: int) -> Result[int]: SftpErrors.unsupported("writeAtBytes")
         self.closeReadCallback: func(SftpRequest) -> Result[bool] = lambda(_request: SftpRequest) -> Result[bool]: Result.Ok(true)
         self.closeWriteCallback: func(SftpRequest) -> Result[bool] = lambda(_request: SftpRequest) -> Result[bool]: Result.Ok(true)
         self.transferErrorCallback: func(SftpRequest, any) = lambda(_request: SftpRequest, _error: any) -> None {
@@ -38,6 +40,8 @@ class SftpHandlers {
         }
         self.hasReadAt: bool = false
         self.hasWriteAt: bool = false
+        self.hasReadAtBytes: bool = false
+        self.hasWriteAtBytes: bool = false
         self.hasStatVFS: bool = false
         self.hasRealPath: bool = false
         self.hasReadlink: bool = false
@@ -68,6 +72,21 @@ class SftpHandlers {
     func onWriteAt(self, callback: func(SftpRequest, list[int], int) -> Result[int]) -> SftpHandlers {
         self.writeAtCallback = callback
         self.hasWriteAt = true
+        return self
+    }
+
+    func onReadAtBytes(self, callback: func(SftpRequest, int, int) -> Result[bytes]) -> SftpHandlers {
+        #- Byte-slice ``readAt``; takes precedence over ``onReadAt``. -#
+        self.readAtBytesCallback = callback
+        self.hasReadAtBytes = true
+        return self
+    }
+
+    func onWriteAtBytes(self, callback: func(SftpRequest, bytes, int) -> Result[int]) -> SftpHandlers {
+        #- Byte-slice ``writeAt``; takes precedence over ``onWriteAt``. The
+           slice is only valid during the call. -#
+        self.writeAtBytesCallback = callback
+        self.hasWriteAtBytes = true
         return self
     }
 
@@ -231,6 +250,16 @@ class SftpHandlers {
         return self
     }
 
+    func useByteStreamingStorage(self, storage: SftpByteStreamingStorage) -> SftpHandlers {
+        self.readAtBytesCallback = storage.readAtBytes
+        self.writeAtBytesCallback = storage.writeAtBytes
+        self.closeReadCallback = storage.closeRead
+        self.closeWriteCallback = storage.closeWrite
+        self.hasReadAtBytes = true
+        self.hasWriteAtBytes = true
+        return self
+    }
+
     func useProtocolStorage(self, storage: SftpProtocolStorage) -> SftpHandlers {
         self.statVFSCallback = storage.statVFS
         self.realPathCallback = storage.realPath
@@ -340,6 +369,33 @@ class SftpHandlers {
             return denied
         }
         result: Result = self.writeAtCallback(request, data, offset)
+        self._after(request, result)
+        return result
+    }
+
+    func dispatchReadAtBytes(self, request: SftpRequest, offset: int, length: int) -> Result[bytes] {
+        before: Result = self._before(request)
+        if not before.ok() {
+            self._after(request, before)
+            return before
+        }
+        result: Result = self.readAtBytesCallback(request, offset, length)
+        self._after(request, result)
+        return result
+    }
+
+    func dispatchWriteAtBytes(self, request: SftpRequest, data: bytes, offset: int) -> Result[int] {
+        before: Result = self._before(request)
+        if not before.ok() {
+            self._after(request, before)
+            return before
+        }
+        if self.readOnly {
+            denied: Result = SftpErrors.permissionDenied(request.path)
+            self._after(request, denied)
+            return denied
+        }
+        result: Result = self.writeAtBytesCallback(request, data, offset)
         self._after(request, result)
         return result
     }

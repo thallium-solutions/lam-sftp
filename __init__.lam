@@ -6,12 +6,8 @@
 # Import with: from @lam/sftp import SftpServer, SftpConfig, SftpHandlers
 
 from .models import SftpExtended, SftpErrors, SftpAuth, SftpRequest, SftpFile, SftpStatVFS
-from .interfaces import SftpStorage, SftpProtocolStorage, SftpStreamingStorage, SftpBackend
+from .interfaces import SftpStorage, SftpProtocolStorage, SftpStreamingStorage, SftpByteStreamingStorage, SftpBackend
 from .metrics import SftpMetrics
 from .handlers import SftpHandlers
 from .config import SftpConfig, SftpKey
 from .server import SftpServer
-
-func tag() -> str {
-    return "@lam/sftp@2.0.0"
-}

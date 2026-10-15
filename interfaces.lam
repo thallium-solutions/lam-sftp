@@ -26,6 +26,16 @@ interface SftpStreamingStorage {
     func closeWrite(request: SftpRequest) -> Result[bool]
 }
 
+#- Streaming storage over native byte slices. ``writeAtBytes`` receives the
+   packet payload without any per-byte conversion; the slice is only valid for
+   the duration of the call, so copy it if it must outlive the callback. -#
+interface SftpByteStreamingStorage {
+    func readAtBytes(request: SftpRequest, offset: int, length: int) -> Result[bytes]
+    func writeAtBytes(request: SftpRequest, data: bytes, offset: int) -> Result[int]
+    func closeRead(request: SftpRequest) -> Result[bool]
+    func closeWrite(request: SftpRequest) -> Result[bool]
+}
+
 interface SftpBackend {
     func read(request: SftpRequest) -> Result[list[int]]
     func write(request: SftpRequest, data: list[int]) -> Result[int]

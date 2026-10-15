@@ -1,0 +1,17 @@
+# Regression: the package no longer declares a root ``tag()`` (name and
+# version live in lamlib.toml), so an application or another package may
+# declare its own top-level ``tag`` and still link with this package.
+#
+# expect: tag=application
+# expect: config=true
+
+from @lam/sftp import SftpConfig
+
+func tag() -> str {
+    return "application"
+}
+
+func main() {
+    print("tag=" + tag())
+    print(f"config={SftpConfig('private-key').validate().ok()}")
+}

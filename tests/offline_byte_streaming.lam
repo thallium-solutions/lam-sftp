@@ -1,0 +1,278 @@
+# Byte-slice streaming storage: ``readAtBytes``/``writeAtBytes`` receive and
+# return ``bytes`` directly, so no per-packet ``[]byte`` <-> ``list[int]``
+# conversion happens. Exercised end to end through a real SFTP client.
+#
+# expect: listening=true
+# expect: uploaded=1048583
+# expect: stored-matches=true
+# expect: downloaded-matches=true
+# expect: ranged=0123456789
+# expect: byte-path-only=true
+# expect: guard-denied=true
+# expect: closures=true
+# expect: readonly-denied=true
+# expect: metrics=true
+
+from @lam/sftp import SftpAuth, SftpConfig, SftpHandlers, SftpKey, SftpRequest, SftpServer
+from lamconcurrency import Mutex
+from lamerrors import Result, Error
+
+go! {
+    import (
+        "bytes"
+        "crypto/sha256"
+        "errors"
+        "fmt"
+        "io"
+        "os"
+
+        clientsftp "github.com/pkg/sftp"
+        "golang.org/x/crypto/ssh"
+    )
+
+    func lamxPayload(n int) []byte {
+        out := make([]byte, n)
+        for i := range out {
+            out[i] = "0123456789abcdef"[i%16]
+        }
+        return out
+    }
+}
+
+class ByteStore {
+    #- In-memory files keyed by path; every callback works on ``bytes``. -#
+    func init(self) {
+        self.mu: Mutex = Mutex()
+        self.files: dict[str, bytes] = {}
+        self.listIntCalls: int = 0
+        self.byteWrites: int = 0
+    }
+
+    func readAtBytes(self, request: SftpRequest, offset: int, length: int) -> Result[bytes] {
+        self.mu.lock()
+        if request.path not in self.files {
+            self.mu.unlock()
+            return Result.Err(Error("SftpNotFound", f"{request.path} does not exist"))
+        }
+        data: bytes = self.files[request.path]
+        self.mu.unlock()
+        out: bytes = data
+        go! {
+            end := offset + length
+            if offset >= len(data) {
+                out = []byte{}
+            } else {
+                if end > len(data) {
+                    end = len(data)
+                }
+                out = data[offset:end]
+            }
+        }
+        return Result.Ok(out)
+    }
+
+    func writeAtBytes(self, request: SftpRequest, data: bytes, offset: int) -> Result[int] {
+        self.mu.lock()
+        current: bytes = go!([]byte{})
+        if request.path in self.files {
+            current = self.files[request.path]
+        }
+        updated: bytes = current
+        go! {
+            need := offset + len(data)
+            if need > len(current) {
+                grown := make([]byte, need)
+                copy(grown, current)
+                current = grown
+            }
+            copy(current[offset:], data)
+            updated = current
+        }
+        self.files[request.path] = updated
+        self.byteWrites += 1
+        self.mu.unlock()
+        return Result.Ok(len(data))
+    }
+
+    func closeRead(self, _request: SftpRequest) -> Result[bool] {
+        return Result.Ok(true)
+    }
+
+    func closeWrite(self, _request: SftpRequest) -> Result[bool] {
+        return Result.Ok(true)
+    }
+
+    func size(self, path: str) -> int {
+        self.mu.lock()
+        n: int = 0
+        if path in self.files {
+            n = len(self.files[path])
+        }
+        self.mu.unlock()
+        return n
+    }
+
+    func digest(self, path: str) -> str {
+        self.mu.lock()
+        data: bytes = go!([]byte{})
+        if path in self.files {
+            data = self.files[path]
+        }
+        self.mu.unlock()
+        return go!(fmt.Sprintf("%x", sha256.Sum256(data)))
+    }
+}
+
+func denyPrivate(request: SftpRequest) -> Result[bool] {
+    return Result.Ok(not request.path.startsWith("/private"))
+}
+
+func startServer(store: ByteStore, readOnly: bool) -> Result[SftpServer] {
+    config: SftpConfig = SftpConfig(SftpKey.generate()?, "127.0.0.1:0")
+    handlers: SftpHandlers = SftpHandlers()
+    # A list[int] callback is registered too: the byte callbacks must win.
+    _ = handlers.onWriteAt(lambda(request: SftpRequest, data: list[int], offset: int) -> Result[int]: Result.Err(Error("Unexpected", "list[int] path used")))
+    _ = handlers.useByteStreamingStorage(store)
+    _ = handlers.guard(denyPrivate)
+    _ = handlers.setReadOnly(readOnly)
+    server: SftpServer = SftpServer(config, handlers)
+    _ = server.onPasswordAuth(lambda(auth: SftpAuth) -> bool: auth.username == "demo")
+    _ = server.listenBackground()?
+    return Result.Ok(server)
+}
+
+func run() -> Result[bool] {
+    store: ByteStore = ByteStore()
+    server: SftpServer = startServer(store, false)?
+    print(f"listening={server.isListening()}")
+    uploaded: int = 0
+    downloadedOk: bool = false
+    ranged: str = ""
+    guardDenied: bool = false
+    expectedDigest: str = ""
+    go! {
+    {
+        config := &ssh.ClientConfig{User: "demo", Auth: []ssh.AuthMethod{ssh.Password("x")}, HostKeyCallback: ssh.InsecureIgnoreHostKey()}
+        conn, err := ssh.Dial("tcp", server.BoundAddress, config)
+        if err != nil {
+            panic(err)
+        }
+        client, err := clientsftp.NewClient(conn)
+        if err != nil {
+            panic(err)
+        }
+        payload := lamxPayload(1048583)
+        expectedDigest = fmt.Sprintf("%x", sha256.Sum256(payload))
+        f, err := client.Create("/big.bin")
+        if err != nil {
+            panic(err)
+        }
+        n, err := f.ReadFrom(bytes.NewReader(payload))
+        if err != nil {
+            panic(err)
+        }
+        uploaded = int(n)
+        _ = f.Close()
+
+        r, err := client.Open("/big.bin")
+        if err != nil {
+            panic(err)
+        }
+        back, _ := io.ReadAll(r)
+        _ = r.Close()
+        downloadedOk = bytes.Equal(back, payload)
+
+        r2, _ := client.Open("/big.bin")
+        part := make([]byte, 10)
+        _, _ = r2.ReadAt(part, 16*1000)
+        ranged = string(part)
+        _ = r2.Close()
+
+        secret, denyErr := client.Create("/private/secret.txt")
+        if denyErr == nil {
+            _, denyErr = secret.Write([]byte("classified"))
+            if closeErr := secret.Close(); denyErr == nil {
+                denyErr = closeErr
+            }
+        }
+        guardDenied = errors.Is(denyErr, os.ErrPermission) && store.Size("/private/secret.txt") == 0
+        _ = client.Close()
+        _ = conn.Close()
+    }
+    }
+    print(f"uploaded={uploaded}")
+    print(f"stored-matches={store.digest('/big.bin') == expectedDigest}")
+    print(f"downloaded-matches={downloadedOk}")
+    print("ranged=" + ranged)
+    print(f"byte-path-only={store.byteWrites > 0 and store.listIntCalls == 0}")
+    print(f"guard-denied={guardDenied}")
+    metrics: dict[str, int] = server.metricsSnapshot()
+    server.shutdown()
+
+    # Closure registration on the server, plus read-only enforcement.
+    seen: list[int] = [0]
+    closureServer: SftpServer = SftpServer(SftpConfig(SftpKey.generate()?, "127.0.0.1:0"))
+    _ = closureServer.onPasswordAuth(lambda(auth: SftpAuth) -> bool: true)
+    _ = closureServer.onReadAtBytes(lambda(request: SftpRequest, offset: int, length: int) -> Result[bytes]: Result.Ok(go!([]byte("closure-data")[:0])))
+    _ = closureServer.onWriteAtBytes(lambda(request: SftpRequest, data: bytes, offset: int) -> Result[int]: recordWrite(seen, data))
+    _ = closureServer.listenBackground()?
+    closureWrote: bool = false
+    go! {
+    {
+        config := &ssh.ClientConfig{User: "u", Auth: []ssh.AuthMethod{ssh.Password("x")}, HostKeyCallback: ssh.InsecureIgnoreHostKey()}
+        conn, err := ssh.Dial("tcp", closureServer.BoundAddress, config)
+        if err != nil {
+            panic(err)
+        }
+        client, _ := clientsftp.NewClient(conn)
+        f, err := client.Create("/c.txt")
+        if err == nil {
+            _, err = f.Write([]byte("hello bytes"))
+            closeErr := f.Close()
+            closureWrote = err == nil && closeErr == nil
+        }
+        _ = client.Close()
+        _ = conn.Close()
+    }
+    }
+    closureServer.shutdown()
+    print(f"closures={closureWrote and seen[0] == 11}")
+
+    readOnlyStore: ByteStore = ByteStore()
+    readOnly: SftpServer = startServer(readOnlyStore, true)?
+    denied: bool = false
+    go! {
+    {
+        config := &ssh.ClientConfig{User: "demo", Auth: []ssh.AuthMethod{ssh.Password("x")}, HostKeyCallback: ssh.InsecureIgnoreHostKey()}
+        conn, err := ssh.Dial("tcp", readOnly.BoundAddress, config)
+        if err != nil {
+            panic(err)
+        }
+        client, _ := clientsftp.NewClient(conn)
+        f, err := client.Create("/x.txt")
+        if err == nil {
+            _, err = f.Write([]byte("nope"))
+            closeErr := f.Close()
+            if err == nil {
+                err = closeErr
+            }
+        }
+        denied = err != nil && readOnlyStore.Size("/x.txt") == 0
+        _ = client.Close()
+        _ = conn.Close()
+    }
+    }
+    readOnly.shutdown()
+    print(f"readonly-denied={denied}")
+    print(f"metrics={metrics['bytesWritten'] == 1048583 and metrics['bytesRead'] >= 1048583}")
+    return Result.Ok(true)
+}
+
+func recordWrite(seen: list[int], data: bytes) -> Result[int] {
+    seen[0] = seen[0] + len(data)
+    return Result.Ok(len(data))
+}
+
+func main() {
+    _ = run().unwrap()
+}

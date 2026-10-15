@@ -37,6 +37,7 @@ go! {
         "fmt"
         "io"
         "os"
+        "time"
 
         clientsftp "github.com/pkg/sftp"
         "golang.org/x/crypto/ssh"
@@ -382,6 +383,11 @@ func run() -> Result[bool] {
         signer, err := ssh.NewSignerFromKey(privateKey)
         if err != nil {
             panic(err)
+        }
+        // The server is limited to one connection and releases the rejected
+        // connection's slot asynchronously; wait (bounded) before dialling.
+        for attempt := 0; attempt < 500 && server.ActiveConnections() > 0; attempt++ {
+            time.Sleep(10 * time.Millisecond)
         }
         keyConfig := &ssh.ClientConfig{
             User:            "keyuser",

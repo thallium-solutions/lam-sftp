@@ -7,7 +7,7 @@ from lamlog import Log
 from lamratelimit import TokenBucket
 from lamtime import Time
 from .models import SftpAuth, SftpFile, SftpRequest, SftpStatVFS
-from .interfaces import SftpBackend, SftpProtocolStorage, SftpStorage, SftpStreamingStorage
+from .interfaces import SftpBackend, SftpByteStreamingStorage, SftpProtocolStorage, SftpStorage, SftpStreamingStorage
 from .metrics import SftpMetrics
 from .handlers import SftpHandlers
 from .config import SftpConfig
@@ -102,6 +102,16 @@ class SftpServer {
 
     func onWriteAt(self, callback: func(SftpRequest, list[int], int) -> Result[int]) -> SftpServer {
         self.handlers.onWriteAt(callback)
+        return self
+    }
+
+    func onReadAtBytes(self, callback: func(SftpRequest, int, int) -> Result[bytes]) -> SftpServer {
+        self.handlers.onReadAtBytes(callback)
+        return self
+    }
+
+    func onWriteAtBytes(self, callback: func(SftpRequest, bytes, int) -> Result[int]) -> SftpServer {
+        self.handlers.onWriteAtBytes(callback)
         return self
     }
 
@@ -245,6 +255,11 @@ class SftpServer {
         return self
     }
 
+    func useByteStreamingStorage(self, storage: SftpByteStreamingStorage) -> SftpServer {
+        self.handlers.useByteStreamingStorage(storage)
+        return self
+    }
+
     func useProtocolStorage(self, storage: SftpProtocolStorage) -> SftpServer {
         self.handlers.useProtocolStorage(storage)
         return self
@@ -333,6 +348,15 @@ class SftpServer {
                 return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("SftpListenError", err.Error(), nil))
             }
             sshConfig := &ssh.ServerConfig{ServerVersion: s.Config.ServerVersion, MaxAuthTries: s.Config.MaxAuthTries}
+            if len(s.Config.Ciphers) > 0 {
+                sshConfig.Config.Ciphers = append([]string(nil), s.Config.Ciphers...)
+            }
+            if len(s.Config.KeyExchanges) > 0 {
+                sshConfig.Config.KeyExchanges = append([]string(nil), s.Config.KeyExchanges...)
+            }
+            if len(s.Config.Macs) > 0 {
+                sshConfig.Config.MACs = append([]string(nil), s.Config.Macs...)
+            }
             for _, keyText := range s.Config.HostKeys {
                 var signer ssh.Signer
                 var err error

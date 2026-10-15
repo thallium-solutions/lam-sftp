@@ -5,6 +5,24 @@ from lamerrors import Result, Error
 from lamos import Os
 from @lam/ssh import SshKeyPair
 
+go! {
+    import "golang.org/x/crypto/ssh"
+
+    // lamSftpUnsupported returns the first name not in ``supported`` (or "").
+    func lamSftpUnsupported(names []string, supported []string) string {
+        known := make(map[string]bool, len(supported))
+        for _, name := range supported {
+            known[name] = true
+        }
+        for _, name := range names {
+            if !known[name] {
+                return name
+            }
+        }
+        return ""
+    }
+}
+
 class SftpConfig {
     func init(self, hostKey: str = "", address: str = "127.0.0.1:2022", startDirectory: str = "/", maxReadBytes: int = 67108864, maxWriteBytes: int = 67108864, maxPacketBytes: int = 32768, maxConnections: int = 256, handshakeTimeoutMs: int = 10000, idleTimeoutMs: int = 300000, maxAuthTries: int = 6, authAttemptsPerSecond: int = 20, authBurst: int = 40) {
         self.hostKey: str = hostKey
@@ -26,6 +44,21 @@ class SftpConfig {
         self.authBurst: int = authBurst
         self.serverVersion: str = "SSH-2.0-lam-sftp"
         self.production: bool = false
+        self.reuseBuffers: bool = true
+        # SSH algorithms offered to clients; empty means the SSH library's
+        # secure defaults. Clients choose their first supported entry.
+        self.ciphers: list[str] = []
+        self.keyExchanges: list[str] = []
+        self.macs: list[str] = []
+    }
+
+    static func fastCiphers() -> list[str] {
+        #- AES-GCM only (hardware-accelerated AEAD). OpenSSH prefers
+           ChaCha20-Poly1305, then AES-CTR with a separate MAC; offering only
+           AES-GCM makes it negotiate the fastest option on CPUs with AES-NI
+           (about 1.6x OpenSSH's default). Supported by OpenSSH 6.2+ and every
+           maintained SFTP client. -#
+        return ["aes128-gcm@openssh.com", "aes256-gcm@openssh.com"]
     }
 
     static func fromKeyFile(path: str, address: str = "127.0.0.1:2022", startDirectory: str = "/", maxReadBytes: int = 67108864, maxWriteBytes: int = 67108864, maxPacketBytes: int = 32768) -> Result[SftpConfig] {
@@ -66,6 +99,21 @@ class SftpConfig {
         }
         if not self.serverVersion.startsWith("SSH-2.0-") {
             return Result.Err(Error("SftpConfigError", "serverVersion must start with SSH-2.0-", None))
+        }
+        ciphers: list[str] = self.ciphers
+        keyExchanges: list[str] = self.keyExchanges
+        macs: list[str] = self.macs
+        badCipher: str = go!(lamSftpUnsupported(ciphers, ssh.SupportedAlgorithms().Ciphers))
+        if badCipher != "" {
+            return Result.Err(Error("SftpConfigError", f"unsupported SSH cipher \"{badCipher}\"", None))
+        }
+        badKex: str = go!(lamSftpUnsupported(keyExchanges, ssh.SupportedAlgorithms().KeyExchanges))
+        if badKex != "" {
+            return Result.Err(Error("SftpConfigError", f"unsupported SSH key exchange \"{badKex}\"", None))
+        }
+        badMac: str = go!(lamSftpUnsupported(macs, ssh.SupportedAlgorithms().MACs))
+        if badMac != "" {
+            return Result.Err(Error("SftpConfigError", f"unsupported SSH MAC \"{badMac}\"", None))
         }
         return Result.Ok(true)
     }
@@ -129,6 +177,29 @@ class SftpConfig {
     func withAuthRateLimit(self, attemptsPerSecond: int, burst: int) -> SftpConfig {
         self.authAttemptsPerSecond = attemptsPerSecond
         self.authBurst = burst
+        return self
+    }
+
+    func withCiphers(self, ciphers: list[str]) -> SftpConfig {
+        #- Restrict the ciphers offered to clients (see ``fastCiphers``). -#
+        self.ciphers = ciphers
+        return self
+    }
+
+    func withKeyExchanges(self, keyExchanges: list[str]) -> SftpConfig {
+        self.keyExchanges = keyExchanges
+        return self
+    }
+
+    func withMacs(self, macs: list[str]) -> SftpConfig {
+        self.macs = macs
+        return self
+    }
+
+    func withBufferReuse(self, enabled: bool = true) -> SftpConfig {
+        #- Reuse SFTP packet buffers across requests (default). Disable only if
+           a byte callback must keep its ``data`` slice after returning. -#
+        self.reuseBuffers = enabled
         return self
     }
 

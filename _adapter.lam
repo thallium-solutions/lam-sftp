@@ -16,6 +16,7 @@ go! {
         "path"
         "strings"
         "sync"
+        "sync/atomic"
         "time"
 
         pkgsftp "github.com/pkg/sftp"
@@ -93,36 +94,54 @@ go! {
         return rt.closed
     }
 
+    // lamSftpDeadlineConn enforces the idle timeout. Arming a socket deadline
+    // on every Read/Write costs a timer update per SSH packet, so a deadline is
+    // only re-armed once its remaining time drops below ``timeout - slack``
+    // (slack = min(timeout/10, 1s)): an idle connection still closes between
+    // ``timeout - slack`` and ``timeout`` after its last activity.
     type lamSftpDeadlineConn struct {
         net.Conn
-        mu      sync.RWMutex
-        timeout time.Duration
+        timeout    atomic.Int64
+        readUntil  atomic.Int64
+        writeUntil atomic.Int64
     }
 
     func (conn *lamSftpDeadlineConn) currentTimeout() time.Duration {
-        conn.mu.RLock()
-        defer conn.mu.RUnlock()
-        return conn.timeout
+        return time.Duration(conn.timeout.Load())
     }
 
     func (conn *lamSftpDeadlineConn) setTimeout(timeout time.Duration) {
-        conn.mu.Lock()
-        conn.timeout = timeout
-        conn.mu.Unlock()
+        conn.timeout.Store(int64(timeout))
+        conn.readUntil.Store(0)
+        conn.writeUntil.Store(0)
         _ = conn.Conn.SetDeadline(time.Time{})
     }
 
-    func (conn *lamSftpDeadlineConn) Read(data []byte) (int, error) {
-        if timeout := conn.currentTimeout(); timeout > 0 {
-            _ = conn.Conn.SetReadDeadline(time.Now().Add(timeout))
+    func (conn *lamSftpDeadlineConn) arm(until *atomic.Int64, set func(time.Time) error) {
+        timeout := conn.currentTimeout()
+        if timeout <= 0 {
+            return
         }
+        slack := timeout / 10
+        if slack > time.Second {
+            slack = time.Second
+        }
+        now := time.Now()
+        if until.Load()-now.UnixNano() > int64(timeout-slack) {
+            return
+        }
+        deadline := now.Add(timeout)
+        until.Store(deadline.UnixNano())
+        _ = set(deadline)
+    }
+
+    func (conn *lamSftpDeadlineConn) Read(data []byte) (int, error) {
+        conn.arm(&conn.readUntil, conn.Conn.SetReadDeadline)
         return conn.Conn.Read(data)
     }
 
     func (conn *lamSftpDeadlineConn) Write(data []byte) (int, error) {
-        if timeout := conn.currentTimeout(); timeout > 0 {
-            _ = conn.Conn.SetWriteDeadline(time.Now().Add(timeout))
-        }
+        conn.arm(&conn.writeUntil, conn.Conn.SetWriteDeadline)
         return conn.Conn.Write(data)
     }
 
@@ -291,10 +310,27 @@ go! {
         if !handle.readable || offset < 0 {
             return 0, os.ErrInvalid
         }
-        result := handle.backend.handlers.DispatchReadAt(handle.request, int(offset), len(target))
-        data, err := lamSftpBytes(result, len(target))
-        if err != nil {
-            return 0, err
+        var data []byte
+        if handle.backend.handlers.HasReadAtBytes {
+            result := handle.backend.handlers.DispatchReadAtBytes(handle.request, int(offset), len(target))
+            if err := lamSftpResultError(result); err != nil {
+                return 0, err
+            }
+            raw, ok := result.Value.([]byte)
+            if !ok && result.Value != nil {
+                return 0, errors.New("readAtBytes callback must return Result[bytes]")
+            }
+            if len(raw) > len(target) {
+                return 0, fmt.Errorf("readAtBytes returned %d bytes for a %d-byte request", len(raw), len(target))
+            }
+            data = raw
+        } else {
+            result := handle.backend.handlers.DispatchReadAt(handle.request, int(offset), len(target))
+            converted, err := lamSftpBytes(result, len(target))
+            if err != nil {
+                return 0, err
+            }
+            data = converted
         }
         count = copy(target, data)
         handle.backend.handlers.Metrics.BytesRead.Add(count)
@@ -314,11 +350,16 @@ go! {
         if !handle.writable || offset < 0 {
             return 0, os.ErrInvalid
         }
-        values := make([]int, len(data))
-        for index, value := range data {
-            values[index] = int(value)
+        var result *Result
+        if handle.backend.handlers.HasWriteAtBytes {
+            result = handle.backend.handlers.DispatchWriteAtBytes(handle.request, data, int(offset))
+        } else {
+            values := make([]int, len(data))
+            for index, value := range data {
+                values[index] = int(value)
+            }
+            result = handle.backend.handlers.DispatchWriteAt(handle.request, values, int(offset))
         }
-        result := handle.backend.handlers.DispatchWriteAt(handle.request, values, int(offset))
         if err := lamSftpResultError(result); err != nil {
             handle.TransferError(err)
             return 0, err
@@ -564,7 +605,7 @@ go! {
 
     func (backend *lamSftpBackend) Fileread(raw *pkgsftp.Request) (io.ReaderAt, error) {
         request := lamSftpRequest(raw, backend)
-        if backend.handlers.HasReadAt {
+        if backend.handlers.HasReadAt || backend.handlers.HasReadAtBytes {
             return &lamSftpStreamingHandle{backend: backend, request: request, readable: true}, nil
         }
         result := backend.read(request)
@@ -578,7 +619,7 @@ go! {
 
     func (backend *lamSftpBackend) Filewrite(raw *pkgsftp.Request) (io.WriterAt, error) {
         request := lamSftpRequest(raw, backend)
-        if backend.handlers.HasWriteAt {
+        if backend.handlers.HasWriteAt || backend.handlers.HasWriteAtBytes {
             return &lamSftpStreamingHandle{backend: backend, request: request, writable: true}, nil
         }
         return &lamSftpWriteBuffer{
@@ -591,10 +632,12 @@ go! {
 
     func (backend *lamSftpBackend) OpenFile(raw *pkgsftp.Request) (pkgsftp.WriterAtReaderAt, error) {
         request := lamSftpRequest(raw, backend)
-        if backend.handlers.HasReadAt && backend.handlers.HasWriteAt {
+        canReadAt := backend.handlers.HasReadAt || backend.handlers.HasReadAtBytes
+        canWriteAt := backend.handlers.HasWriteAt || backend.handlers.HasWriteAtBytes
+        if canReadAt && canWriteAt {
             return &lamSftpStreamingHandle{backend: backend, request: request, readable: true, writable: true}, nil
         }
-        if backend.handlers.HasReadAt != backend.handlers.HasWriteAt {
+        if canReadAt != canWriteAt {
             return nil, fmt.Errorf("%w: read-write Open requires both readAt and writeAt callbacks", pkgsftp.ErrSSHFxOpUnsupported)
         }
         var data []byte
@@ -838,6 +881,16 @@ go! {
                         maxRead:  server.Config.MaxReadBytes,
                         maxWrite: server.Config.MaxWriteBytes,
                     }
+                    options := []pkgsftp.RequestServerOption{
+                        pkgsftp.WithStartDirectory(server.Config.StartDirectory),
+                        pkgsftp.WithRSMaxTxPacket(uint32(server.Config.MaxPacketBytes)),
+                    }
+                    if server.Config.ReuseBuffers {
+                        // Reuse packet buffers across requests instead of
+                        // allocating one per packet; byte callbacks must not
+                        // retain their ``data`` slice (documented contract).
+                        options = append(options, pkgsftp.WithRSAllocator())
+                    }
                     requestServer := pkgsftp.NewRequestServer(
                         channel,
                         pkgsftp.Handlers{
@@ -846,8 +899,7 @@ go! {
                             FileCmd:  backend,
                             FileList: backend,
                         },
-                        pkgsftp.WithStartDirectory(server.Config.StartDirectory),
-                        pkgsftp.WithRSMaxTxPacket(uint32(server.Config.MaxPacketBytes)),
+                        options...,
                     )
                     _ = requestServer.Serve()
                     return

@@ -2,6 +2,48 @@
 
 All notable changes to `@lam/sftp` are documented here.
 
+## 3.0.0 - 2026-10-15
+
+### Added
+
+- Byte-slice streaming: `onReadAtBytes`/`onWriteAtBytes` on `SftpHandlers` and
+  `SftpServer`, the `SftpByteStreamingStorage` interface and
+  `useByteStreamingStorage`. Packet payloads reach the callback as `bytes`
+  without the per-byte `list[int]` conversion (about 25% more loopback
+  throughput, no per-packet `[]int` allocation). Byte callbacks take
+  precedence over the `list[int]` ones; guards, read-only mode and metrics
+  apply unchanged.
+- SSH algorithm configuration: `withCiphers`, `withKeyExchanges`, `withMacs`
+  (validated against the SSH library) and `SftpConfig.fastCiphers()` (AES-GCM
+  only). OpenSSH clients then negotiate AES-GCM instead of ChaCha20-Poly1305:
+  about 2x single-session throughput (443 → 881 MB/s upload, 445 → 1117 MB/s
+  download) and 1.6–2.2x with 8 parallel sessions.
+- `withBufferReuse(enabled)`: packet buffers are reused across requests by
+  default.
+- `benchmarks/throughput.lam`: single- and multi-session throughput benchmark
+  (in-process clients, external clients, CPU profiles).
+
+### Changed
+
+- Fewer per-packet costs: reused packet buffers and lazily re-armed idle
+  deadlines raised in-process upload throughput with 8 sessions from about
+  3.0 to 4.3 GB/s. The idle timeout now closes a connection between
+  `idleTimeoutMs - min(idleTimeoutMs/10, 1s)` and `idleTimeoutMs` after its
+  last activity.
+
+### Fixed
+
+- `offline_server_roundtrip` waits for the single connection slot of the
+  rejected login to be released before dialling again; under load the server
+  could still be holding it and refuse the public-key connection.
+
+### Removed
+
+- **Breaking:** removed the root `tag()` helper. The package name and version
+  are declared in `lamlib.toml`, and the generic top-level function made this
+  package impossible to link together with any other package (or application)
+  that also declared `tag()`, because all Lam modules share one Go package.
+
 ## 2.0.0 - 2026-09-30
 
 ### Added

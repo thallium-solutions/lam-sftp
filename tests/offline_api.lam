@@ -1,4 +1,3 @@
-# expect: @lam/sftp@2.0.0
 # expect: false
 # expect: true
 # expect: true
@@ -11,7 +10,7 @@
 # expect: true
 # expect: true
 
-from @lam/sftp import SftpAuth, SftpConfig, SftpErrors, SftpFile, SftpHandlers, SftpRequest, SftpServer, tag
+from @lam/sftp import SftpAuth, SftpConfig, SftpErrors, SftpFile, SftpHandlers, SftpRequest, SftpServer
 from lamerrors import Result
 
 class DemoStorage {
@@ -33,8 +32,6 @@ class DemoStorage {
 }
 
 func main() {
-    print(tag())
-
     missing: SftpConfig = SftpConfig()
     print(missing.validate().ok())
     valid: SftpConfig = SftpConfig("private-key")
