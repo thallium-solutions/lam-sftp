@@ -19,3 +19,10 @@ __pycache__/
 *.py[cod]
 *.log
 *.exe
+
+# Python virtual environments and tool caches
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
