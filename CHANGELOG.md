@@ -2,6 +2,16 @@
 
 All notable changes to `@lam/sftp` are documented here.
 
+## 3.1.0 - 2026-10-17
+
+### Added
+
+- `SftpServer.activeSessions()`: the authenticated connections with their
+  auth metadata, `username`, `remoteAddress` and `connectedAt`.
+- `SftpServer.disconnectWhere(key, value)`: closes every authenticated
+  connection whose auth metadata `key` equals `value` (e.g. a suspended
+  account or a revoked key) and returns how many were closed.
+
 ## 3.0.1 - 2026-10-16
 
 ### Fixed

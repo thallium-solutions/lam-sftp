@@ -101,13 +101,13 @@ without a `v` prefix). Its manifest resolves the pinned `@lam/ssh` 3.0.0
 dependency transitively:
 
 ```bash
-lamc install https://github.com/thallium-solutions/lam-sftp.git@3.0.1
+lamc install https://github.com/thallium-solutions/lam-sftp.git@3.1.0
 ```
 
 After a registry release, use the canonical scoped name:
 
 ```bash
-lamc install @lam/sftp@3.0.1
+lamc install @lam/sftp@3.1.0
 ```
 
 For sibling-checkout development, declare the package in an application project
@@ -311,6 +311,23 @@ func readTenantFile(request: SftpRequest) -> Result[list[int]] {
 
 The password is cleared before session metadata is retained. Never place
 credentials or other secrets in `auth.meta`.
+
+The same metadata identifies live sessions, so access can be withdrawn
+immediately (an account suspended, a key revoked) without waiting for the
+client to disconnect:
+
+```lammergeier
+for session in server.activeSessions() {
+    print(session["username"], session["remoteAddress"], session["tenant"])
+}
+closed: int = server.disconnectWhere("tenant", suspendedTenantId)
+```
+
+`activeSessions()` returns one entry per authenticated connection with its
+auth metadata plus `username`, `remoteAddress` and `connectedAt` (Unix
+seconds). `disconnectWhere(key, value)` closes every connection whose metadata
+`key` equals `value` and returns how many it closed; their transfers in
+progress fail, other connections are unaffected.
 
 ## Request routing
 

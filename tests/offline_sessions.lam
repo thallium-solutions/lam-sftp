@@ -1,0 +1,106 @@
+# Active sessions: ``activeSessions()`` lists authenticated connections with
+# their auth metadata, and ``disconnectWhere(key, value)`` closes the matching
+# ones at once (e.g. when an account is suspended) while other users stay
+# connected.
+#
+# expect: sessions-before=2
+# expect: alice-meta=acct-alice
+# expect: alice-remote-set=true
+# expect: disconnected=1
+# expect: alice-after=closed
+# expect: bob-after=ok
+# expect: sessions-after=1
+# expect: no-match=0
+
+from @lam/sftp import SftpAuth, SftpConfig, SftpKey, SftpServer
+from lamerrors import Result
+from lamtime import Time
+
+go! {
+    import (
+        "net"
+        "time"
+
+        clientsftp "github.com/pkg/sftp"
+        "golang.org/x/crypto/ssh"
+    )
+
+    type sessionsClient struct {
+        ssh  *ssh.Client
+        sftp *clientsftp.Client
+    }
+
+    func sessionsDial(address, user string) (*sessionsClient, error) {
+        cfg := &ssh.ClientConfig{User: user, Auth: []ssh.AuthMethod{ssh.Password("x")}, HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: 5 * time.Second}
+        raw, err := net.Dial("tcp", address)
+        if err != nil {
+            return nil, err
+        }
+        conn, chans, reqs, err := ssh.NewClientConn(raw, address, cfg)
+        if err != nil {
+            raw.Close()
+            return nil, err
+        }
+        client := ssh.NewClient(conn, chans, reqs)
+        files, err := clientsftp.NewClient(client)
+        if err != nil {
+            client.Close()
+            return nil, err
+        }
+        return &sessionsClient{ssh: client, sftp: files}, nil
+    }
+
+    func (c *sessionsClient) probe() string {
+        if _, err := c.sftp.Getwd(); err != nil {
+            return "closed"
+        }
+        return "ok"
+    }
+}
+
+func tagAccount(auth: SftpAuth) -> bool {
+    _ = auth.set("account", "acct-" + auth.username)
+    return true
+}
+
+func run() -> Result[bool] {
+    server: SftpServer = SftpServer(SftpConfig(SftpKey.generate()?, "127.0.0.1:0"))
+    _ = server.onPasswordAuth(tagAccount)
+    _ = server.listenBackground()?
+    address: str = server.BoundAddress
+    alice: any = None
+    bob: any = None
+    go! {
+        alice, _ = sessionsDial(address, "alice")
+        bob, _ = sessionsDial(address, "bob")
+    }
+    before: list[dict[str, str]] = server.activeSessions()
+    print(f"sessions-before={len(before)}")
+    for session in before {
+        if session["username"] == "alice" {
+            print("alice-meta=" + session["account"])
+            print(f"alice-remote-set={session['remoteAddress'].startsWith('127.0.0.1:')}")
+        }
+    }
+    print(f"disconnected={server.disconnectWhere('account', 'acct-alice')}")
+    Time.sleepMs(100)
+    aliceAfter: str = ""
+    bobAfter: str = ""
+    go! {
+        aliceAfter = alice.(*sessionsClient).probe()
+        bobAfter = bob.(*sessionsClient).probe()
+    }
+    print("alice-after=" + aliceAfter)
+    print("bob-after=" + bobAfter)
+    print(f"sessions-after={len(server.activeSessions())}")
+    print(f"no-match={server.disconnectWhere('account', 'acct-nobody')}")
+    go! {
+        bob.(*sessionsClient).ssh.Close()
+    }
+    server.shutdown()
+    return Result.Ok(true)
+}
+
+func main() {
+    _ = run().unwrap()
+}

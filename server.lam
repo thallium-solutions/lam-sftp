@@ -551,6 +551,39 @@ class SftpServer {
         }
     }
 
+    #- Authenticated connections: each entry holds the auth ``meta`` set by
+       the auth callback plus ``username``, ``remoteAddress`` and
+       ``connectedAt`` (Unix seconds). -#
+    func activeSessions(self) -> list[dict[str, str]] {
+        self._stateMu.rLock()
+        raw: any = self._raw
+        self._stateMu.rUnlock()
+        out: list[dict[str, str]] = []
+        go! {
+            if runtime, ok := raw.(*lamSftpRuntime); ok && runtime != nil {
+                out = runtime.snapshot()
+            }
+        }
+        return out
+    }
+
+    #- Closes, at once, every authenticated connection whose auth metadata
+       ``key`` equals ``value`` (e.g. an account that was suspended or whose
+       key was revoked) and returns how many were closed. Transfers in
+       progress on those connections fail; other users are unaffected. -#
+    func disconnectWhere(self, key: str, value: str) -> int {
+        self._stateMu.rLock()
+        raw: any = self._raw
+        self._stateMu.rUnlock()
+        closed: int = 0
+        go! {
+            if runtime, ok := raw.(*lamSftpRuntime); ok && runtime != nil {
+                closed = runtime.disconnect(key, value)
+            }
+        }
+        return closed
+    }
+
     func isListening(self) -> bool {
         self._stateMu.rLock()
         raw: any = self._raw

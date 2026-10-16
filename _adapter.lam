@@ -17,6 +17,7 @@ go! {
         "strings"
         "sync"
         "sync/atomic"
+        "strconv"
         "time"
 
         pkgsftp "github.com/pkg/sftp"
@@ -41,6 +42,8 @@ go! {
         mu             sync.Mutex
         listener       net.Listener
         conns          map[net.Conn]struct{}
+        // Authenticated connections and their auth metadata.
+        sessions       map[net.Conn]map[string]string
         closed         bool
         finished       chan struct{}
         sshConfig      *ssh.ServerConfig
@@ -63,8 +66,58 @@ go! {
     func (rt *lamSftpRuntime) remove(conn net.Conn) {
         rt.mu.Lock()
         delete(rt.conns, conn)
+        delete(rt.sessions, conn)
         rt.mu.Unlock()
         rt.wg.Done()
+    }
+
+    func (rt *lamSftpRuntime) track(conn net.Conn, connection *ssh.ServerConn) {
+        info := map[string]string{}
+        if connection.Permissions != nil {
+            for key, value := range connection.Permissions.Extensions {
+                info[key] = value
+            }
+        }
+        info["username"] = connection.User()
+        info["remoteAddress"] = connection.RemoteAddr().String()
+        info["connectedAt"] = strconv.FormatInt(time.Now().Unix(), 10)
+        rt.mu.Lock()
+        if rt.sessions == nil {
+            rt.sessions = make(map[net.Conn]map[string]string)
+        }
+        rt.sessions[conn] = info
+        rt.mu.Unlock()
+    }
+
+    func (rt *lamSftpRuntime) snapshot() []map[string]string {
+        rt.mu.Lock()
+        defer rt.mu.Unlock()
+        out := make([]map[string]string, 0, len(rt.sessions))
+        for _, info := range rt.sessions {
+            copied := make(map[string]string, len(info))
+            for key, value := range info {
+                copied[key] = value
+            }
+            out = append(out, copied)
+        }
+        return out
+    }
+
+    // disconnect closes the authenticated connections whose metadata has
+    // key == value and returns how many there were.
+    func (rt *lamSftpRuntime) disconnect(key, value string) int {
+        rt.mu.Lock()
+        var matched []net.Conn
+        for conn, info := range rt.sessions {
+            if got, ok := info[key]; ok && got == value {
+                matched = append(matched, conn)
+            }
+        }
+        rt.mu.Unlock()
+        for _, conn := range matched {
+            _ = conn.Close()
+        }
+        return len(matched)
     }
 
     func (rt *lamSftpRuntime) stop() {
@@ -927,6 +980,7 @@ go! {
             _ = raw.SetDeadline(time.Time{})
         }
         defer connection.Close()
+        runtime.track(raw, connection)
         go ssh.DiscardRequests(requests)
         lamSftpServeChannels(connection, channels, server)
     }
