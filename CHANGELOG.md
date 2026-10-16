@@ -2,6 +2,15 @@
 
 All notable changes to `@lam/sftp` are documented here.
 
+## 3.0.1 - 2026-10-16
+
+### Fixed
+
+- The `@lam/ssh` dependency pointed at the tag `v2.0.0`, which is not
+  published (release tags are plain versions), so installing the package from
+  Git failed. It now pins `@lam/ssh` `3.0.0`, the release this package is
+  tested with.
+
 ## 3.0.0 - 2026-10-15
 
 ### Added

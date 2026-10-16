@@ -75,7 +75,7 @@ from @lam/sftp import SftpServer, SftpConfig, SftpHandlers
 
 - Lammergeier compiler (`lamc`) **1.18.0 or newer** within the compatible
   `1.x` line (`^1.18`).
-- `@lam/ssh` v2.0.0, resolved transitively from its pinned Git release.
+- `@lam/ssh` 3.0.0, resolved transitively from its pinned Git release.
 - Go **1.25.0 or newer**, required by `github.com/pkg/sftp v1.13.11`.
 
 ## Compliance profile
@@ -96,17 +96,18 @@ engine. Open and Mkdir creation-attribute limitations inherited from
 
 ## Installation
 
-Install the package directly from its Git release. Its manifest resolves the
-pinned `@lam/ssh` v2.0.0 dependency transitively:
+Install the package directly from its Git release (tags are plain versions,
+without a `v` prefix). Its manifest resolves the pinned `@lam/ssh` 3.0.0
+dependency transitively:
 
 ```bash
-lamc install https://github.com/thallium-solutions/lam-sftp.git@v2.0.0
+lamc install https://github.com/thallium-solutions/lam-sftp.git@3.0.1
 ```
 
 After a registry release, use the canonical scoped name:
 
 ```bash
-lamc install @lam/sftp@2.0.0
+lamc install @lam/sftp@3.0.1
 ```
 
 For sibling-checkout development, declare the package in an application project
