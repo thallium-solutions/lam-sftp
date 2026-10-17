@@ -2,6 +2,14 @@
 
 All notable changes to `@lam/sftp` are documented here.
 
+## 3.3.1 - 2026-10-22
+
+### Security
+
+- Pins `@lam/ssh` 3.0.1, which moves `golang.org/x/crypto` to v0.58.0
+  (GO-2026-6354 and GO-2026-6355: denial of service through deadlocked SSH
+  channels, reachable on an SSH/SFTP server). Requires Go 1.26.
+
 ## 3.3.0 - 2026-10-19
 
 ### Added
