@@ -2,6 +2,21 @@
 
 All notable changes to `@lam/sftp` are documented here.
 
+## 3.2.0 - 2026-10-19
+
+### Added
+
+- `onOpenWrite(req)`: called when a client opens a file for writing, before
+  any data. An error becomes the OPEN status (missing parent directory,
+  permission, quota), so clients that create parent directories on demand
+  (curl/libssh `--ftp-create-dirs`) and POSIX-style tools see the failure at
+  open instead of on the first write.
+
+### Changed
+
+- Read-only servers (`setReadOnly`) refuse opening a file for writing at
+  OPEN, not only on the first write.
+
 ## 3.1.0 - 2026-10-17
 
 ### Added

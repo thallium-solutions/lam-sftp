@@ -1,6 +1,6 @@
 [library]
 name = "@lam/sftp"
-version = "3.1.0"
+version = "3.2.0"
 description = "Callback-driven, storage-agnostic SFTP server for Lammergeier"
 license = "Apache-2.0"
 authors = ["Lammergeier contributors"]

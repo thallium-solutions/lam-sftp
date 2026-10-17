@@ -125,6 +125,12 @@ class SftpServer {
         return self
     }
 
+    func onOpenWrite(self, callback: func(SftpRequest) -> Result[bool]) -> SftpServer {
+        #- See ``SftpHandlers.onOpenWrite``. -#
+        self.handlers.onOpenWrite(callback)
+        return self
+    }
+
     func onTransferError(self, callback: func(SftpRequest, any)) -> SftpServer {
         self.handlers.onTransferError(callback)
         return self

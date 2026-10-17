@@ -670,8 +670,20 @@ go! {
         return bytes.NewReader(data), nil
     }
 
+    func (backend *lamSftpBackend) openWrite(request *SftpRequest) (err error) {
+        defer func() {
+            if recovered := recover(); recovered != nil {
+                err = lamSftpResultError(lamSftpFailure("SftpCallbackError", fmt.Sprintf("openWrite callback panicked: %v", recovered)))
+            }
+        }()
+        return lamSftpResultError(backend.handlers.DispatchOpenWrite(request))
+    }
+
     func (backend *lamSftpBackend) Filewrite(raw *pkgsftp.Request) (io.WriterAt, error) {
         request := lamSftpRequest(raw, backend)
+        if err := backend.openWrite(request); err != nil {
+            return nil, err
+        }
         if backend.handlers.HasWriteAt || backend.handlers.HasWriteAtBytes {
             return &lamSftpStreamingHandle{backend: backend, request: request, writable: true}, nil
         }
@@ -687,6 +699,11 @@ go! {
         request := lamSftpRequest(raw, backend)
         canReadAt := backend.handlers.HasReadAt || backend.handlers.HasReadAtBytes
         canWriteAt := backend.handlers.HasWriteAt || backend.handlers.HasWriteAtBytes
+        if flags := raw.Pflags(); flags.Write || flags.Creat || flags.Trunc || flags.Append {
+            if err := backend.openWrite(request); err != nil {
+                return nil, err
+            }
+        }
         if canReadAt && canWriteAt {
             return &lamSftpStreamingHandle{backend: backend, request: request, readable: true, writable: true}, nil
         }

@@ -35,6 +35,7 @@ class SftpHandlers {
         self.writeAtBytesCallback: func(SftpRequest, bytes, int) -> Result[int] = lambda(_request: SftpRequest, _data: bytes, _offset: int) -> Result[int]: SftpErrors.unsupported("writeAtBytes")
         self.closeReadCallback: func(SftpRequest) -> Result[bool] = lambda(_request: SftpRequest) -> Result[bool]: Result.Ok(true)
         self.closeWriteCallback: func(SftpRequest) -> Result[bool] = lambda(_request: SftpRequest) -> Result[bool]: Result.Ok(true)
+        self.openWriteCallback: func(SftpRequest) -> Result[bool] = lambda(_request: SftpRequest) -> Result[bool]: Result.Ok(true)
         self.transferErrorCallback: func(SftpRequest, any) = lambda(_request: SftpRequest, _error: any) -> None {
             _ = _error
         }
@@ -97,6 +98,14 @@ class SftpHandlers {
 
     func onCloseWrite(self, callback: func(SftpRequest) -> Result[bool]) -> SftpHandlers {
         self.closeWriteCallback = callback
+        return self
+    }
+
+    func onOpenWrite(self, callback: func(SftpRequest) -> Result[bool]) -> SftpHandlers {
+        #- Called when a client opens a file for writing, before any data:
+           an error is returned to the client as the OPEN status (missing
+           parent directory, permission, quota), as POSIX clients expect. -#
+        self.openWriteCallback = callback
         return self
     }
 
@@ -405,6 +414,20 @@ class SftpHandlers {
         result: Result = self.closeReadCallback(request)
         self._after(request, result)
         return result
+    }
+
+    func dispatchOpenWrite(self, request: SftpRequest) -> Result[bool] {
+        before: Result = self._before(request)
+        if not before.ok() {
+            self._after(request, before)
+            return before
+        }
+        if self.readOnly {
+            denied: Result = SftpErrors.permissionDenied(request.path)
+            self._after(request, denied)
+            return denied
+        }
+        return self.openWriteCallback(request)
     }
 
     func dispatchCloseWrite(self, request: SftpRequest) -> Result[bool] {

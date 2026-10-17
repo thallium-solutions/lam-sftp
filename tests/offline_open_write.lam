@@ -1,0 +1,137 @@
+# Open for writing: ``onOpenWrite`` runs when a client opens a file for
+# writing, before any data, so errors (missing parent directory, permission,
+# quota) come back as the OPEN status, as POSIX clients and libssh expect.
+# Read-only servers refuse writes at open too.
+#
+# expect: missing-parent=file does not exist
+# expect: denied=permission denied
+# expect: allowed=ok 5
+# expect: opened=/ok/file.txt
+# expect: readonly=permission denied
+
+from @lam/sftp import SftpAuth, SftpConfig, SftpErrors, SftpKey, SftpRequest, SftpServer
+from lamerrors import Result
+
+go! {
+    import (
+        "errors"
+        "os"
+        "strings"
+        "time"
+
+        clientsftp "github.com/pkg/sftp"
+        "golang.org/x/crypto/ssh"
+    )
+
+    func openWriteDial(address string) (*clientsftp.Client, error) {
+        cfg := &ssh.ClientConfig{User: "u", Auth: []ssh.AuthMethod{ssh.Password("x")}, HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: 5 * time.Second}
+        client, err := ssh.Dial("tcp", address, cfg)
+        if err != nil {
+            return nil, err
+        }
+        return clientsftp.NewClient(client)
+    }
+
+    func openWriteStatus(err error) string {
+        switch {
+        case err == nil:
+            return "ok"
+        case errors.Is(err, os.ErrNotExist):
+            return "file does not exist"
+        case errors.Is(err, os.ErrPermission):
+            return "permission denied"
+        }
+        return strings.ToLower(err.Error())
+    }
+
+    func openWriteCreate(c *clientsftp.Client, path string) string {
+        f, err := c.Create(path)
+        if err != nil {
+            return openWriteStatus(err)
+        }
+        n, err := f.Write([]byte("hello"))
+        if cerr := f.Close(); err == nil {
+            err = cerr
+        }
+        if err != nil {
+            return openWriteStatus(err)
+        }
+        return "ok " + string(rune('0'+n))
+    }
+}
+
+opened: list[str] = []
+
+func checkOpen(request: SftpRequest) -> Result[bool] {
+    if request.path.startsWith("/missing/") {
+        return SftpErrors.notFound(request.path)
+    }
+    if request.path.startsWith("/denied/") {
+        return SftpErrors.permissionDenied(request.path)
+    }
+    opened.append(request.path)
+    return Result.Ok(true)
+}
+
+func store(_request: SftpRequest, data: list[int]) -> Result[int] {
+    return Result.Ok(len(data))
+}
+
+func accept(_auth: SftpAuth) -> bool {
+    return true
+}
+
+func run() -> Result[bool] {
+    server: SftpServer = SftpServer(SftpConfig(SftpKey.generate()?, "127.0.0.1:0"))
+    _ = server.onPasswordAuth(accept)
+    _ = server.onWrite(store)
+    _ = server.onOpenWrite(checkOpen)
+    _ = server.listenBackground()?
+    address: str = server.BoundAddress
+    results: list[str] = []
+    go! {
+        c, err := openWriteDial(address)
+        if err != nil {
+            results = []string{"dial: " + err.Error()}
+        } else {
+            results = append(results, openWriteCreate(c, "/missing/file.txt"))
+            results = append(results, openWriteCreate(c, "/denied/file.txt"))
+            results = append(results, openWriteCreate(c, "/ok/file.txt"))
+            c.Close()
+        }
+    }
+    print(f"missing-parent={results[0]}")
+    print(f"denied={results[1]}")
+    print(f"allowed={results[2]}")
+    print(f"opened={','.join(opened)}")
+    server.shutdown()
+
+    readonly: SftpServer = SftpServer(SftpConfig(SftpKey.generate()?, "127.0.0.1:0"))
+    _ = readonly.onPasswordAuth(accept)
+    _ = readonly.onWrite(store)
+    _ = readonly.setReadOnly(true)
+    _ = readonly.listenBackground()?
+    roAddress: str = readonly.BoundAddress
+    roResult: str = ""
+    go! {
+        ro, dialErr := openWriteDial(roAddress)
+        if dialErr == nil {
+            f, createErr := ro.Create("/x.txt")
+            if createErr == nil {
+                f.Close()
+            }
+            roResult = openWriteStatus(createErr)
+            ro.Close()
+        }
+    }
+    print(f"readonly={roResult}")
+    readonly.shutdown()
+    return Result.Ok(true)
+}
+
+func main() {
+    r: Result[bool] = run()
+    if not r.ok() {
+        print(f"error: {r.error}")
+    }
+}

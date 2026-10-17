@@ -365,6 +365,7 @@ registering these callbacks:
 | `onReadAt(req, offset, length)` | Return at most `length` bytes beginning at `offset`; a short result signals EOF. |
 | `onWriteAt(req, data, offset)` | Persist one random-access chunk and return the number of bytes written. |
 | `onCloseRead(req)` | Release a read transaction or range-reader. |
+| `onOpenWrite(req)` | Validate an open for writing before any data arrives (missing parent, permission, quota); the error is the OPEN status. |
 | `onCloseWrite(req)` | Commit/finalize an upload after all writes succeed. |
 | `onTransferError(req, error)` | Abort or clean up after a connection/transfer failure; `onCloseWrite` is skipped after failure. |
 
