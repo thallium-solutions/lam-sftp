@@ -585,6 +585,18 @@ config = config.withMacs(["hmac-sha2-256-etm@openssh.com"])  # unused by AEAD ci
 Names are validated against the SSH library (`SftpConfigError` for unknown
 ones); empty lists keep the library's secure defaults.
 
+AES-GCM is missing from libssh2 before 1.11 (curl on Debian 12, PHP ssh2,
+many integrations), which cannot connect to a GCM-only server. Adaptive
+ciphers keep both: the server reads the client's SSH version line before the
+handshake and offers the fast list only to clients known to support it
+(`SftpConfig.gcmCapable`: OpenSSH 6.2+, libssh 0.9+, libssh2 1.11+, Go,
+paramiko 3.5+, PuTTY 0.76+); every other client, and one that stays silent
+for a second, gets `fallback` (default: the library's list):
+
+```lammergeier
+config = config.withAdaptiveCiphers(SftpConfig.fastCiphers())
+```
+
 Measured on an Intel i9-13900HX over loopback (server on 16 threads, clients
 on the other 16; `benchmarks/throughput.lam` and OpenSSH 8.9 `sftp` with its
 default settings, 1 GiB per session):

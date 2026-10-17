@@ -48,6 +48,11 @@ class SftpConfig {
         # SSH algorithms offered to clients; empty means the SSH library's
         # secure defaults. Clients choose their first supported entry.
         self.ciphers: list[str] = []
+        # Adaptive ciphers: ``ciphers`` is offered only to clients whose SSH
+        # version line shows support for them (``gcmCapable``); everyone else
+        # gets ``fallbackCiphers`` (empty = the SSH library's defaults).
+        self.adaptiveCiphers: bool = false
+        self.fallbackCiphers: list[str] = []
         self.keyExchanges: list[str] = []
         self.macs: list[str] = []
     }
@@ -56,8 +61,9 @@ class SftpConfig {
         #- AES-GCM only (hardware-accelerated AEAD). OpenSSH prefers
            ChaCha20-Poly1305, then AES-CTR with a separate MAC; offering only
            AES-GCM makes it negotiate the fastest option on CPUs with AES-NI
-           (about 1.6x OpenSSH's default). Supported by OpenSSH 6.2+ and every
-           maintained SFTP client. -#
+           (about 1.6x OpenSSH's default). Not supported by libssh2 before
+           1.11 (curl on Debian 12, PHP ssh2): use ``withAdaptiveCiphers`` to
+           offer it only to clients that support it. -#
         return ["aes128-gcm@openssh.com", "aes256-gcm@openssh.com"]
     }
 
@@ -103,6 +109,11 @@ class SftpConfig {
         ciphers: list[str] = self.ciphers
         keyExchanges: list[str] = self.keyExchanges
         macs: list[str] = self.macs
+        fallbackCiphers: list[str] = self.fallbackCiphers
+        badFallback: str = go!(lamSftpUnsupported(fallbackCiphers, ssh.SupportedAlgorithms().Ciphers))
+        if badFallback != "" {
+            return Result.Err(Error("SftpConfigError", f"unsupported SSH cipher \"{badFallback}\"", None))
+        }
         badCipher: str = go!(lamSftpUnsupported(ciphers, ssh.SupportedAlgorithms().Ciphers))
         if badCipher != "" {
             return Result.Err(Error("SftpConfigError", f"unsupported SSH cipher \"{badCipher}\"", None))
@@ -181,9 +192,33 @@ class SftpConfig {
     }
 
     func withCiphers(self, ciphers: list[str]) -> SftpConfig {
-        #- Restrict the ciphers offered to clients (see ``fastCiphers``). -#
+        #- Restrict the ciphers offered to every client (see ``fastCiphers``). -#
         self.ciphers = ciphers
+        self.adaptiveCiphers = false
         return self
+    }
+
+    func withAdaptiveCiphers(self, ciphers: list[str], fallback: list[str] = []) -> SftpConfig {
+        #- Offer ``ciphers`` (e.g. ``fastCiphers()``) to clients known to
+           support them, judged by their SSH version line, and ``fallback``
+           (empty = library defaults) to every other client, so older
+           libraries (libssh2 < 1.11) still connect. A client that does not
+           send its version line within a second gets the fallback. -#
+        self.ciphers = ciphers
+        self.fallbackCiphers = fallback
+        self.adaptiveCiphers = true
+        return self
+    }
+
+    static func gcmCapable(clientVersion: str) -> bool {
+        #- True for SSH clients known to implement AES-GCM
+           (``aes128-gcm@openssh.com``): OpenSSH 6.2+, libssh 0.9+, libssh2
+           1.11+, Go's x/crypto (rclone, ...), paramiko 3.5+, PuTTY 0.76+. -#
+        out: bool = false
+        go! {
+            out = lamSftpGcmCapable(clientVersion)
+        }
+        return out
     }
 
     func withKeyExchanges(self, keyExchanges: list[str]) -> SftpConfig {

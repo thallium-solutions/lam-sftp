@@ -413,11 +413,18 @@ class SftpServer {
             if err != nil {
                 return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("SftpListenError", err.Error(), nil))
             }
+            var fallbackConfig *ssh.ServerConfig
+            if s.Config.AdaptiveCiphers {
+                copied := *sshConfig
+                copied.Config.Ciphers = append([]string(nil), s.Config.FallbackCiphers...)
+                fallbackConfig = &copied
+            }
             runtime := &lamSftpRuntime{
                 listener:       listener,
                 conns:          make(map[net.Conn]struct{}),
                 finished:       make(chan struct{}),
                 sshConfig:      sshConfig,
+                fallbackConfig: fallbackConfig,
                 maxConnections: s.Config.MaxConnections,
                 idleTimeout:    time.Duration(s.Config.IdleTimeoutMs) * time.Millisecond,
             }

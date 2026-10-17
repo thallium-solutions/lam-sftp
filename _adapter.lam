@@ -47,6 +47,9 @@ go! {
         closed         bool
         finished       chan struct{}
         sshConfig      *ssh.ServerConfig
+        // Set for adaptive ciphers: offered to clients not known to
+        // support sshConfig's ciphers.
+        fallbackConfig *ssh.ServerConfig
         maxConnections int
         idleTimeout    time.Duration
         wg             sync.WaitGroup
@@ -978,16 +981,127 @@ go! {
         }
     }
 
+    // lamSftpReplayConn hands bytes already read (the client's version line)
+    // back to the SSH handshake before reading from the connection.
+    type lamSftpReplayConn struct {
+        net.Conn
+        prefix []byte
+    }
+
+    func (c *lamSftpReplayConn) Read(p []byte) (int, error) {
+        if len(c.prefix) > 0 {
+            n := copy(p, c.prefix)
+            c.prefix = c.prefix[n:]
+            return n, nil
+        }
+        return c.Conn.Read(p)
+    }
+
+    // lamSftpPeekClientVersion reads the client's identification line
+    // ("SSH-2.0-OpenSSH_9.6\r\n", RFC 4253 4.2: at most 255 bytes) within
+    // wait. It returns the version ("" when absent) and every byte read.
+    func lamSftpPeekClientVersion(conn net.Conn, wait time.Duration) (string, []byte) {
+        // Bypass the idle-timeout wrapper, whose reads re-arm their own deadline.
+        if deadlineConn, ok := conn.(*lamSftpDeadlineConn); ok {
+            conn = deadlineConn.Conn
+        }
+        _ = conn.SetReadDeadline(time.Now().Add(wait))
+        defer conn.SetReadDeadline(time.Time{})
+        buf := make([]byte, 0, 256)
+        one := make([]byte, 1)
+        for len(buf) < 255 {
+            n, err := conn.Read(one)
+            if n == 1 {
+                buf = append(buf, one[0])
+                if one[0] == '\n' {
+                    break
+                }
+            }
+            if err != nil {
+                break
+            }
+        }
+        line := strings.TrimRight(string(buf), "\r\n")
+        if !strings.HasPrefix(line, "SSH-") {
+            return "", buf
+        }
+        return line, buf
+    }
+
+    func lamSftpVersionAtLeast(text string, want ...int) bool {
+        parts := strings.FieldsFunc(text, func(r rune) bool { return r == '.' || r == '_' || r == 'p' || r == ' ' || r == '-' })
+        for i, w := range want {
+            if i >= len(parts) {
+                return false
+            }
+            n, err := strconv.Atoi(parts[i])
+            if err != nil {
+                return false
+            }
+            if n != w {
+                return n > w
+            }
+        }
+        return true
+    }
+
+    // lamSftpGcmCapable reports whether a client version line belongs to an
+    // implementation known to support aes*-gcm@openssh.com.
+    func lamSftpGcmCapable(version string) bool {
+        software := version
+        if i := strings.Index(version, "-"); i >= 0 {
+            if j := strings.Index(version[i+1:], "-"); j >= 0 {
+                software = version[i+1+j+1:]
+            }
+        }
+        fields := strings.Fields(software)
+        if len(fields) == 0 {
+            return false
+        }
+        software = fields[0]
+        rules := []struct {
+            prefix string
+            min    []int
+        }{
+            {"OpenSSH_", []int{6, 2}},
+            {"libssh2_", []int{1, 11}},
+            {"libssh_", []int{0, 9}},
+            {"paramiko_", []int{3, 5}},
+            {"PuTTY_Release_", []int{0, 76}},
+            {"Go", nil},
+        }
+        for _, rule := range rules {
+            if !strings.HasPrefix(software, rule.prefix) {
+                continue
+            }
+            if rule.min == nil {
+                return software == "Go"
+            }
+            return lamSftpVersionAtLeast(strings.TrimPrefix(software, rule.prefix), rule.min...)
+        }
+        return false
+    }
+
     func lamSftpServeConnection(raw net.Conn, server *SftpServer, runtime *lamSftpRuntime, sshConfig *ssh.ServerConfig) {
         defer func() { _ = recover() }()
         defer runtime.remove(raw)
         defer raw.Close()
+        // Adaptive ciphers: choose the offer from the client's version line
+        // (read here and replayed to the handshake).
+        var handshakeConn net.Conn = raw
+        if runtime.fallbackConfig != nil {
+            version, replay := lamSftpPeekClientVersion(raw, time.Second)
+            handshakeConn = &lamSftpReplayConn{Conn: raw, prefix: replay}
+            if !lamSftpGcmCapable(version) {
+                sshConfig = runtime.fallbackConfig
+            }
+        }
         if deadlineConn, ok := raw.(*lamSftpDeadlineConn); ok {
             _ = deadlineConn.Conn.SetDeadline(time.Now().Add(time.Duration(server.Config.HandshakeTimeoutMs) * time.Millisecond))
         } else {
             _ = raw.SetDeadline(time.Now().Add(time.Duration(server.Config.HandshakeTimeoutMs) * time.Millisecond))
         }
-        connection, channels, requests, err := ssh.NewServerConn(raw, sshConfig)
+        connection, channels, requests, err := ssh.NewServerConn(handshakeConn, sshConfig)
         if err != nil {
             return
         }

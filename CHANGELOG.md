@@ -2,6 +2,24 @@
 
 All notable changes to `@lam/sftp` are documented here.
 
+## 3.3.0 - 2026-10-19
+
+### Added
+
+- `SftpConfig.withAdaptiveCiphers(ciphers, fallback = [])`: offers `ciphers`
+  (e.g. `fastCiphers()`) only to clients whose SSH version line shows
+  support for them and `fallback` (default: the library's defaults) to every
+  other client. The version line is read before the handshake (at most one
+  second; silent clients get the fallback) and replayed to it.
+- `SftpConfig.gcmCapable(clientVersion)`: OpenSSH 6.2+, libssh 0.9+,
+  libssh2 1.11+, Go x/crypto, paramiko 3.5+, PuTTY 0.76+.
+
+### Fixed
+
+- The `fastCiphers()` documentation claimed every maintained client supports
+  AES-GCM; libssh2 before 1.11 (curl on Debian 12, PHP ssh2) does not and
+  could not connect to a GCM-only server.
+
 ## 3.2.0 - 2026-10-19
 
 ### Added

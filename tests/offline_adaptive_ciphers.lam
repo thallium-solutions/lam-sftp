@@ -1,0 +1,95 @@
+# Adaptive ciphers: ``withAdaptiveCiphers(fastCiphers())`` offers AES-GCM
+# only to clients whose SSH version line shows support for it and the
+# library defaults to everyone else, so libssh2 < 1.11 (curl on Debian 12,
+# PHP ssh2) still connects while OpenSSH negotiates the fast cipher.
+#
+# expect: openssh-9.6=true
+# expect: openssh-6.1=false
+# expect: libssh2-1.10=false
+# expect: libssh2-1.11=true
+# expect: libssh-0.9.6=true
+# expect: paramiko-3.5.1=true
+# expect: go=true
+# expect: unknown=false
+# expect: empty=false
+# expect: old-libssh2-ctr=ok
+# expect: openssh-ctr=refused
+# expect: openssh-gcm=ok
+# expect: silent-client-ctr=ok
+# expect: strict-old-libssh2=refused
+
+from @lam/sftp import SftpAuth, SftpConfig, SftpKey, SftpServer
+from lamerrors import Result
+
+go! {
+    import (
+        "net"
+        "time"
+
+        "golang.org/x/crypto/ssh"
+    )
+
+    func adaptiveDial(address, version, cipher string, silence time.Duration) string {
+        raw, err := net.DialTimeout("tcp", address, 5*time.Second)
+        if err != nil {
+            return "dial: " + err.Error()
+        }
+        defer raw.Close()
+        time.Sleep(silence)
+        cfg := &ssh.ClientConfig{
+            User:            "u",
+            Auth:            []ssh.AuthMethod{ssh.Password("x")},
+            HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+            ClientVersion:   version,
+            Config:          ssh.Config{Ciphers: []string{cipher}},
+            Timeout:         5 * time.Second,
+        }
+        _ = raw.SetDeadline(time.Now().Add(10 * time.Second))
+        conn, chans, reqs, err := ssh.NewClientConn(raw, address, cfg)
+        if err != nil {
+            return "refused"
+        }
+        ssh.NewClient(conn, chans, reqs).Close()
+        return "ok"
+    }
+}
+
+func accept(_auth: SftpAuth) -> bool {
+    return true
+}
+
+func dial(address: str, version: str, cipher: str, silenceMs: int) -> str {
+    out: str = ""
+    go! { out = adaptiveDial(address, version, cipher, time.Duration(silenceMs)*time.Millisecond) }
+    return out
+}
+
+func run() -> Result[bool] {
+    cases: list[list[str]] = [["openssh-9.6", "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13"], ["openssh-6.1", "SSH-2.0-OpenSSH_6.1"], ["libssh2-1.10", "SSH-2.0-libssh2_1.10.0"], ["libssh2-1.11", "SSH-2.0-libssh2_1.11.0"], ["libssh-0.9.6", "SSH-2.0-libssh_0.9.6"], ["paramiko-3.5.1", "SSH-2.0-paramiko_3.5.1"], ["go", "SSH-2.0-Go"], ["unknown", "SSH-2.0-SomeClient_1.0"], ["empty", ""]]
+    for pair in cases {
+        print(f"{pair[0]}={SftpConfig.gcmCapable(pair[1])}")
+    }
+    adaptive: SftpServer = SftpServer(SftpConfig(SftpKey.generate()?, "127.0.0.1:0").withAdaptiveCiphers(SftpConfig.fastCiphers()))
+    _ = adaptive.onPasswordAuth(accept)
+    _ = adaptive.listenBackground()?
+    address: str = adaptive.BoundAddress
+    print("old-libssh2-ctr=" + dial(address, "SSH-2.0-libssh2_1.10.0", "aes128-ctr", 0))
+    print("openssh-ctr=" + dial(address, "SSH-2.0-OpenSSH_9.6", "aes128-ctr", 0))
+    print("openssh-gcm=" + dial(address, "SSH-2.0-OpenSSH_9.6", "aes128-gcm@openssh.com", 0))
+    print("silent-client-ctr=" + dial(address, "SSH-2.0-OpenSSH_9.6", "aes128-ctr", 1300))
+    adaptive.shutdown()
+
+    strict: SftpServer = SftpServer(SftpConfig(SftpKey.generate()?, "127.0.0.1:0").withCiphers(SftpConfig.fastCiphers()))
+    _ = strict.onPasswordAuth(accept)
+    _ = strict.listenBackground()?
+    print("strict-old-libssh2=" + dial(strict.BoundAddress, "SSH-2.0-libssh2_1.10.0", "aes128-ctr", 0))
+    strict.shutdown()
+    return Result.Ok(true)
+}
+
+func main() {
+    r: Result[bool] = run()
+    if not r.ok() {
+        print(f"error: {r.error}")
+    }
+}
