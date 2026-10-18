@@ -74,8 +74,8 @@ from @lam/sftp import SftpServer, SftpConfig, SftpHandlers
 ## Requirements
 
 - Lammergeier compiler (`lamc`) **1.18.0 or newer** within the compatible
-  `1.x` line (`^1.18`).
-- `@lam/ssh` 3.0.0, resolved transitively from its pinned Git release.
+  `1.x` and `2.x` lines (`>=1.18, <3`).
+- `@lam/ssh` 3.0.2, resolved transitively from its pinned Git release.
 - Go **1.25.0 or newer**, required by `github.com/pkg/sftp v1.13.11`.
 
 ## Compliance profile
