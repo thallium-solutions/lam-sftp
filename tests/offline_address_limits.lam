@@ -1,0 +1,101 @@
+# Per-address authentication limits: a token bucket per client IP checked
+# before the server-wide budget, and a lockout after repeated failures.
+# One noisy address cannot block sign-ins from other addresses.
+#
+# expect: burst-ok=true
+# expect: over-burst=false
+# expect: other-address=true
+# expect: same-ip-other-port=false
+# expect: ipv6-keyed=true
+# expect: locked-by-third=true
+# expect: locked=false
+# expect: other-ok=true
+# expect: unlock=true
+# expect: success-resets=false
+# expect: invalid-config=false
+# expect: half-lockout=false
+# expect: wrong-password-locks=true
+# expect: good-password-refused=refused
+# expect: other-client-ok=ok
+# expect: throttled-metric=true
+
+from @lam/sftp import SftpAddressLimiter, SftpAuth, SftpConfig, SftpKey, SftpServer
+from lamerrors import Result
+
+go! {
+    import (
+        "net"
+        "time"
+
+        "golang.org/x/crypto/ssh"
+    )
+
+    // limitsDial signs in from a given local address (127.0.0.x).
+    func limitsDial(address, local, password string) string {
+        dialer := &net.Dialer{Timeout: 5 * time.Second, LocalAddr: &net.TCPAddr{IP: net.ParseIP(local)}}
+        raw, err := dialer.Dial("tcp", address)
+        if err != nil {
+            return "dial: " + err.Error()
+        }
+        cfg := &ssh.ClientConfig{User: "u", Auth: []ssh.AuthMethod{ssh.Password(password)}, HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: 5 * time.Second}
+        conn, chans, reqs, err := ssh.NewClientConn(raw, address, cfg)
+        if err != nil {
+            raw.Close()
+            return "refused"
+        }
+        ssh.NewClient(conn, chans, reqs).Close()
+        return "ok"
+    }
+}
+
+func checkPassword(auth: SftpAuth) -> bool {
+    return auth.password == "right"
+}
+
+func run() -> Result[bool] {
+    rate: SftpAddressLimiter = SftpAddressLimiter(60, 3, 0, 0)
+    a: bool = rate.allow("10.0.0.1:5000") and rate.allow("10.0.0.1:5001") and rate.allow("10.0.0.1:5002")
+    print(f"burst-ok={a}")
+    print(f"over-burst={rate.allow('10.0.0.1:5003')}")
+    print(f"other-address={rate.allow('10.0.0.2:5000')}")
+    print(f"same-ip-other-port={rate.allow('10.0.0.1:6000')}")
+    print(f"ipv6-keyed={rate.allow('[2001:db8::1]:22') and rate.allow('2001:db8::2')}")
+
+    lock: SftpAddressLimiter = SftpAddressLimiter(0, 0, 3, 600)
+    _ = lock.recordFailure("10.0.0.9:1")
+    _ = lock.recordFailure("10.0.0.9:2")
+    print(f"locked-by-third={lock.recordFailure('10.0.0.9:3')}")
+    print(f"locked={lock.allow('10.0.0.9:4')}")
+    print(f"other-ok={lock.allow('10.0.0.8:4')}")
+    lock.unlock("10.0.0.9")
+    print(f"unlock={lock.allow('10.0.0.9:5')}")
+    _ = lock.recordFailure("10.0.0.7:1")
+    _ = lock.recordFailure("10.0.0.7:1")
+    lock.recordSuccess("10.0.0.7:1")
+    print(f"success-resets={lock.recordFailure('10.0.0.7:1')}")
+
+    bad: Result[bool] = SftpConfig(SftpKey.generate()?, "127.0.0.1:0").withAddressAuthRateLimit(-1, 1).validate()
+    print(f"invalid-config={bad.ok()}")
+    half: Result[bool] = SftpConfig(SftpKey.generate()?, "127.0.0.1:0").withAddressLockout(5, 0).validate()
+    print(f"half-lockout={half.ok()}")
+
+    config: SftpConfig = SftpConfig(SftpKey.generate()?, "127.0.0.1:0").withAddressLockout(3, 600)
+    server: SftpServer = SftpServer(config)
+    _ = server.onPasswordAuth(checkPassword)
+    _ = server.listenBackground()?
+    address: str = server.boundAddress
+    for i in range(3) {
+        _ = go!(limitsDial(address, "127.0.0.2", "wrong"))
+    }
+    print(f"wrong-password-locks={server.addressLimiter.isLocked('127.0.0.2:1')}")
+    print("good-password-refused=" + go!(limitsDial(address, "127.0.0.2", "right")))
+    print("other-client-ok=" + go!(limitsDial(address, "127.0.0.3", "right")))
+    snapshot: dict[str, int] = server.metricsSnapshot()
+    print(f"throttled-metric={snapshot['authThrottled'] >= 1}")
+    server.shutdown()
+    return Result.Ok(true)
+}
+
+func main() {
+    _ = run().unwrap()
+}

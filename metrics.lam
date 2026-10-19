@@ -10,6 +10,8 @@ class SftpMetrics {
         self.connectionsRejected: Atomic = Atomic(0)
         self.authSucceeded: Atomic = Atomic(0)
         self.authFailed: Atomic = Atomic(0)
+        # Attempts refused by the per-address limits (rate or lockout).
+        self.authThrottled: Atomic = Atomic(0)
         self.requests: Atomic = Atomic(0)
         self.failures: Atomic = Atomic(0)
         self.bytesRead: Atomic = Atomic(0)
@@ -32,6 +34,7 @@ class SftpMetrics {
             "connectionsRejected": self.connectionsRejected.get(),
             "authSucceeded": self.authSucceeded.get(),
             "authFailed": self.authFailed.get(),
+            "authThrottled": self.authThrottled.get(),
             "requests": self.requests.get(),
             "failures": self.failures.get(),
             "bytesRead": self.bytesRead.get(),

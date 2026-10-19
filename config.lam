@@ -42,6 +42,13 @@ class SftpConfig {
         self.maxAuthTries: int = maxAuthTries
         self.authAttemptsPerSecond: int = authAttemptsPerSecond
         self.authBurst: int = authBurst
+        # Per client address (IP): attempts per minute and burst (0 = off),
+        # and a lockout after ``addressMaxFailures`` failures within
+        # ``addressLockoutSeconds`` (0 = off).
+        self.addressAttemptsPerMinute: int = 0
+        self.addressBurst: int = 0
+        self.addressMaxFailures: int = 0
+        self.addressLockoutSeconds: int = 0
         self.serverVersion: str = "SSH-2.0-lam-sftp"
         self.production: bool = false
         self.reuseBuffers: bool = true
@@ -102,6 +109,12 @@ class SftpConfig {
         }
         if self.authAttemptsPerSecond < 0 or self.authBurst < 1 {
             return Result.Err(Error("SftpConfigError", "authAttemptsPerSecond cannot be negative and authBurst must be positive", None))
+        }
+        if self.addressAttemptsPerMinute < 0 or self.addressBurst < 0 or self.addressMaxFailures < 0 or self.addressLockoutSeconds < 0 {
+            return Result.Err(Error("SftpConfigError", "per-address authentication limits cannot be negative", None))
+        }
+        if (self.addressMaxFailures > 0) != (self.addressLockoutSeconds > 0) {
+            return Result.Err(Error("SftpConfigError", "withAddressLockout needs both maxFailures and lockoutSeconds", None))
         }
         if not self.serverVersion.startsWith("SSH-2.0-") {
             return Result.Err(Error("SftpConfigError", "serverVersion must start with SSH-2.0-", None))
@@ -188,6 +201,26 @@ class SftpConfig {
     func withAuthRateLimit(self, attemptsPerSecond: int, burst: int) -> SftpConfig {
         self.authAttemptsPerSecond = attemptsPerSecond
         self.authBurst = burst
+        return self
+    }
+
+    #- Limits authentication attempts per client IP (``attemptsPerMinute``
+       steady rate, ``burst`` at once), checked before the server-wide
+       ``withAuthRateLimit`` budget so one address cannot use it up for
+       everybody. 0 disables it. -#
+    func withAddressAuthRateLimit(self, attemptsPerMinute: int, burst: int) -> SftpConfig {
+        self.addressAttemptsPerMinute = attemptsPerMinute
+        self.addressBurst = burst
+        return self
+    }
+
+    #- Refuses every authentication attempt from a client IP for
+       ``lockoutSeconds`` after ``maxFailures`` failed attempts within
+       ``lockoutSeconds``; a successful sign-in resets the count. 0 disables
+       it. -#
+    func withAddressLockout(self, maxFailures: int, lockoutSeconds: int) -> SftpConfig {
+        self.addressMaxFailures = maxFailures
+        self.addressLockoutSeconds = lockoutSeconds
         return self
     }
 

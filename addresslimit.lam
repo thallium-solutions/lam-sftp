@@ -1,0 +1,209 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+go! {
+    import (
+        "net"
+        "sync"
+        "time"
+    )
+
+    type lamSftpAddrState struct {
+        tokens      float64
+        last        time.Time
+        failures    int
+        windowStart time.Time
+        lockedUntil time.Time
+    }
+
+    type lamSftpAddrTable struct {
+        mu      sync.Mutex
+        entries map[string]*lamSftpAddrState
+    }
+
+    // lamSftpAddrKey is the client's IP without the port (IPv6 included).
+    func lamSftpAddrKey(address string) string {
+        if host, _, err := net.SplitHostPort(address); err == nil {
+            return host
+        }
+        return address
+    }
+
+    // lamSftpAddrEvict drops idle entries once the table is large, so a
+    // flood of spoofed or rotating addresses cannot grow it without bound.
+    func (t *lamSftpAddrTable) evict(now time.Time, maxEntries int, idle time.Duration) {
+        if len(t.entries) < maxEntries {
+            return
+        }
+        for key, st := range t.entries {
+            if now.Sub(st.last) > idle && now.After(st.lockedUntil) {
+                delete(t.entries, key)
+            }
+        }
+        if len(t.entries) >= maxEntries {
+            // Still full: forget the oldest half of unlocked entries.
+            n := 0
+            for key, st := range t.entries {
+                if now.After(st.lockedUntil) {
+                    delete(t.entries, key)
+                    n++
+                    if n >= maxEntries/2 {
+                        break
+                    }
+                }
+            }
+        }
+    }
+}
+
+#- Per-client-address authentication limits (see
+   ``SftpConfig.withAddressAuthRateLimit`` and ``withAddressLockout``):
+   a token bucket per source IP, and a lockout of the address after too many
+   failed attempts within a window. Thread-safe; bounded in size. -#
+class SftpAddressLimiter {
+    func init(self, attemptsPerMinute: int = 0, burst: int = 0, maxFailures: int = 0, windowSeconds: int = 0, maxEntries: int = 100000) {
+        self.attemptsPerMinute: int = attemptsPerMinute
+        self.burst: int = burst if burst > 0 else attemptsPerMinute
+        self.maxFailures: int = maxFailures
+        self.windowSeconds: int = windowSeconds
+        self.maxEntries: int = maxEntries if maxEntries > 0 else 100000
+        self._table: any = None
+        go! {
+            s._table = &lamSftpAddrTable{entries: map[string]*lamSftpAddrState{}}
+        }
+    }
+
+    func enabled(self) -> bool {
+        return self.attemptsPerMinute > 0 or (self.maxFailures > 0 and self.windowSeconds > 0)
+    }
+
+    #- Takes one attempt for ``address`` (``host:port`` or an IP); false when
+       the address is locked out or over its rate. -#
+    func allow(self, address: str) -> bool {
+        if not self.enabled() {
+            return true
+        }
+        rate: int = self.attemptsPerMinute
+        burst: int = self.burst
+        maxEntries: int = self.maxEntries
+        idleSeconds: int = max(self.windowSeconds, 600)
+        allowed: bool = true
+        go! {
+            t := s._table.(*lamSftpAddrTable)
+            key := lamSftpAddrKey(address)
+            now := time.Now()
+            t.mu.Lock()
+            st, ok := t.entries[key]
+            if !ok {
+                t.evict(now, maxEntries, time.Duration(idleSeconds)*time.Second)
+                st = &lamSftpAddrState{tokens: float64(burst), last: now, windowStart: now}
+                t.entries[key] = st
+            }
+            if now.Before(st.lockedUntil) {
+                allowed = false
+            } else if rate > 0 {
+                st.tokens += now.Sub(st.last).Seconds() * float64(rate) / 60.0
+                if st.tokens > float64(burst) {
+                    st.tokens = float64(burst)
+                }
+                if st.tokens >= 1 {
+                    st.tokens -= 1
+                } else {
+                    allowed = false
+                }
+            }
+            st.last = now
+            t.mu.Unlock()
+        }
+        return allowed
+    }
+
+    #- Records a failed attempt; locks the address for ``windowSeconds``
+       once ``maxFailures`` failures happened within the window. Returns
+       true when this failure locked the address. -#
+    func recordFailure(self, address: str) -> bool {
+        if self.maxFailures <= 0 or self.windowSeconds <= 0 {
+            return false
+        }
+        maxFailures: int = self.maxFailures
+        window: int = self.windowSeconds
+        locked: bool = false
+        go! {
+            t := s._table.(*lamSftpAddrTable)
+            key := lamSftpAddrKey(address)
+            now := time.Now()
+            t.mu.Lock()
+            st, ok := t.entries[key]
+            if !ok {
+                st = &lamSftpAddrState{last: now, windowStart: now}
+                t.entries[key] = st
+            }
+            if now.Sub(st.windowStart) > time.Duration(window)*time.Second {
+                st.windowStart = now
+                st.failures = 0
+            }
+            st.failures++
+            if st.failures >= maxFailures && !now.Before(st.lockedUntil) {
+                st.lockedUntil = now.Add(time.Duration(window) * time.Second)
+                st.failures = 0
+                st.windowStart = now
+                locked = true
+            }
+            t.mu.Unlock()
+        }
+        return locked
+    }
+
+    #- A successful sign-in clears the address's failure count. -#
+    func recordSuccess(self, address: str) {
+        if self.maxFailures <= 0 {
+            return
+        }
+        go! {
+            t := s._table.(*lamSftpAddrTable)
+            t.mu.Lock()
+            if st, ok := t.entries[lamSftpAddrKey(address)]; ok {
+                st.failures = 0
+            }
+            t.mu.Unlock()
+        }
+    }
+
+    func isLocked(self, address: str) -> bool {
+        locked: bool = false
+        go! {
+            t := s._table.(*lamSftpAddrTable)
+            t.mu.Lock()
+            if st, ok := t.entries[lamSftpAddrKey(address)]; ok {
+                locked = time.Now().Before(st.lockedUntil)
+            }
+            t.mu.Unlock()
+        }
+        return locked
+    }
+
+    #- Lifts a lockout (operators, tests). -#
+    func unlock(self, address: str) {
+        go! {
+            t := s._table.(*lamSftpAddrTable)
+            t.mu.Lock()
+            delete(t.entries, lamSftpAddrKey(address))
+            t.mu.Unlock()
+        }
+    }
+
+    func size(self) -> int {
+        n: int = 0
+        go! {
+            t := s._table.(*lamSftpAddrTable)
+            t.mu.Lock()
+            n = len(t.entries)
+            t.mu.Unlock()
+        }
+        return n
+    }
+}
+
+func main() {
+    pass
+}

@@ -11,6 +11,7 @@ from .interfaces import SftpBackend, SftpByteStreamingStorage, SftpProtocolStora
 from .metrics import SftpMetrics
 from .handlers import SftpHandlers
 from .config import SftpConfig
+from .addresslimit import SftpAddressLimiter
 from ._adapter import sftpAdapterLoaded
 
 go! {
@@ -40,6 +41,7 @@ class SftpServer {
             rate = 1
         }
         self.authLimiter: TokenBucket = TokenBucket(burst, rate)
+        self.addressLimiter: SftpAddressLimiter = SftpAddressLimiter(config.addressAttemptsPerMinute, config.addressBurst, config.addressMaxFailures, config.addressLockoutSeconds)
         self.startedUnix: int = 0
         self.passwordAuth: func(SftpAuth) -> bool = lambda(_auth: SftpAuth) -> bool: false
         self.publicKeyAuth: func(SftpAuth) -> bool = lambda(_auth: SftpAuth) -> bool: false
@@ -60,6 +62,26 @@ class SftpServer {
             return true
         }
         return self.authLimiter.takeAvailable(1)
+    }
+
+    #- The per-address limits first (a refused address does not spend the
+       server-wide budget), then the server-wide one. -#
+    func allowAuthFrom(self, address: str) -> bool {
+        if not self.addressLimiter.allow(address) {
+            _ = self.metrics.authThrottled.increment()
+            return false
+        }
+        return self.allowAuthAttempt()
+    }
+
+    #- Feeds the per-address lockout; called by the adapter after every
+       authentication callback. -#
+    func recordAuthOutcome(self, address: str, accepted: bool) {
+        if accepted {
+            self.addressLimiter.recordSuccess(address)
+        } else {
+            _ = self.addressLimiter.recordFailure(address)
+        }
     }
 
     func uptimeSeconds(self) -> int {

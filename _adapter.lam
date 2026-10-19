@@ -898,12 +898,13 @@ go! {
                 server.Metrics.AuthFailed.Increment()
             }
         }()
-        if !server.AllowAuthAttempt() {
+        if !server.AllowAuthFrom(auth.RemoteAddress) {
             server.Metrics.AuthFailed.Increment()
             return false
         }
         handler, ok := callback.(func(*SftpAuth) bool)
         accepted = ok && handler(auth)
+        server.RecordAuthOutcome(auth.RemoteAddress, accepted)
         if accepted {
             server.Metrics.AuthSucceeded.Increment()
         } else {

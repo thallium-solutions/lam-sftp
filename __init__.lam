@@ -11,3 +11,4 @@ from .metrics import SftpMetrics
 from .handlers import SftpHandlers
 from .config import SftpConfig, SftpKey
 from .server import SftpServer
+from .addresslimit import SftpAddressLimiter

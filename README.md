@@ -527,6 +527,8 @@ config: SftpConfig = (SftpConfig(hostKey)
     .withConnectionLimit(256)
     .withTimeouts(10000, 300000)
     .withAuthRateLimit(20, 40)
+    .withAddressAuthRateLimit(120, 60)
+    .withAddressLockout(50, 600)
     .productionMode())
 ```
 
@@ -547,6 +549,16 @@ start without bounded reads/writes, idle and authentication limits, and
 - `maxAuthTries` is passed to `ssh.ServerConfig`.
 - `authAttemptsPerSecond` and `authBurst` use the stdlib `TokenBucket` to bound
   aggregate authentication work. Set the rate to `0` only outside production.
+- `withAddressAuthRateLimit(attemptsPerMinute, burst)` gives every client IP
+  its own budget, checked before the server-wide one, so a single address
+  hammering the server cannot use up `authAttemptsPerSecond` and lock
+  everybody out. `withAddressLockout(maxFailures, seconds)` refuses an IP for
+  `seconds` after `maxFailures` failed attempts within `seconds` (a successful
+  sign-in resets the count). Both are off by default; size them for clients
+  behind a shared NAT and for SSH clients that offer several keys (each
+  rejected key counts as a failed attempt). The state is per server process,
+  bounded in size, and available as `server.addressLimiter`
+  (`SftpAddressLimiter`: `allow`, `recordFailure`, `isLocked`, `unlock`).
 - Multiple host keys permit algorithm migration without abruptly changing the
   server identity for every client.
 - Unhandled lifecycle errors are written through stdlib `lamlog.Log`; an
@@ -554,7 +566,7 @@ start without bounded reads/writes, idle and authentication limits, and
 
 `server.metrics` is an `SftpMetrics` instance backed by stdlib `Atomic`
 counters. `snapshot()` returns accepted/rejected connections, authentication
-success/failure, request/failure counts, and bytes read/written. `uptimeSeconds()`
+success/failure, attempts refused by the per-address limits (`authThrottled`), request/failure counts, and bytes read/written. `uptimeSeconds()`
 uses stdlib `lamtime.Time`.
 
 ```lammergeier

@@ -2,6 +2,18 @@
 
 All notable changes to `@lam/sftp` are documented here.
 
+## [3.4.0] - 2026-10-19
+
+### Added
+
+- Per-address authentication limits: `SftpConfig.withAddressAuthRateLimit`
+  (a token bucket per client IP, checked before the server-wide
+  `withAuthRateLimit` budget) and `withAddressLockout` (refuse an IP after
+  repeated failures within a window). One address can no longer exhaust the
+  server-wide budget and block sign-ins for everybody. Off by default.
+- `SftpAddressLimiter` (`server.addressLimiter`), `SftpServer.allowAuthFrom`
+  and `recordAuthOutcome`, and the `authThrottled` metric.
+
 ## [3.3.2] - 2026-10-18
 
 ### Changed
