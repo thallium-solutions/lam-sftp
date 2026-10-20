@@ -72,7 +72,7 @@ func run() -> Result[bool] {
     adaptive: SftpServer = SftpServer(SftpConfig(SftpKey.generate()?, "127.0.0.1:0").withAdaptiveCiphers(SftpConfig.fastCiphers()))
     _ = adaptive.onPasswordAuth(accept)
     _ = adaptive.listenBackground()?
-    address: str = adaptive.BoundAddress
+    address: str = adaptive.boundAddress
     print("old-libssh2-ctr=" + dial(address, "SSH-2.0-libssh2_1.10.0", "aes128-ctr", 0))
     print("openssh-ctr=" + dial(address, "SSH-2.0-OpenSSH_9.6", "aes128-ctr", 0))
     print("openssh-gcm=" + dial(address, "SSH-2.0-OpenSSH_9.6", "aes128-gcm@openssh.com", 0))
@@ -82,7 +82,7 @@ func run() -> Result[bool] {
     strict: SftpServer = SftpServer(SftpConfig(SftpKey.generate()?, "127.0.0.1:0").withCiphers(SftpConfig.fastCiphers()))
     _ = strict.onPasswordAuth(accept)
     _ = strict.listenBackground()?
-    print("strict-old-libssh2=" + dial(strict.BoundAddress, "SSH-2.0-libssh2_1.10.0", "aes128-ctr", 0))
+    print("strict-old-libssh2=" + dial(strict.boundAddress, "SSH-2.0-libssh2_1.10.0", "aes128-ctr", 0))
     strict.shutdown()
     return Result.Ok(true)
 }

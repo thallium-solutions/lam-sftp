@@ -50,6 +50,10 @@ class SftpConfig {
         self.addressMaxFailures: int = 0
         self.addressLockoutSeconds: int = 0
         self.serverVersion: str = "SSH-2.0-lam-sftp"
+        # PROXY protocol (v1/v2) from trusted load balancers: "off",
+        # "optional" or "required" (see ``withProxyProtocol``).
+        self.proxyProtocol: str = "off"
+        self.proxyTrusted: list[str] = []
         self.production: bool = false
         self.reuseBuffers: bool = true
         # SSH algorithms offered to clients; empty means the SSH library's
@@ -115,6 +119,17 @@ class SftpConfig {
         }
         if (self.addressMaxFailures > 0) != (self.addressLockoutSeconds > 0) {
             return Result.Err(Error("SftpConfigError", "withAddressLockout needs both maxFailures and lockoutSeconds", None))
+        }
+        if self.proxyProtocol != "off" and self.proxyProtocol != "optional" and self.proxyProtocol != "required" {
+            return Result.Err(Error("SftpConfigError", "proxy protocol mode must be off, optional or required", None))
+        }
+        if self.proxyProtocol != "off" and len(self.proxyTrusted) == 0 {
+            return Result.Err(Error("SftpConfigError", "withProxyProtocol needs at least one trusted CIDR", None))
+        }
+        trusted: list[str] = self.proxyTrusted
+        badTrusted: str = go!(lamSftpBadCidr(trusted))
+        if badTrusted != "" {
+            return Result.Err(Error("SftpConfigError", f"invalid trusted proxy address \"{badTrusted}\"", None))
         }
         if not self.serverVersion.startsWith("SSH-2.0-") {
             return Result.Err(Error("SftpConfigError", "serverVersion must start with SSH-2.0-", None))
@@ -221,6 +236,20 @@ class SftpConfig {
     func withAddressLockout(self, maxFailures: int, lockoutSeconds: int) -> SftpConfig {
         self.addressMaxFailures = maxFailures
         self.addressLockoutSeconds = lockoutSeconds
+        return self
+    }
+
+    #- Accepts a PROXY protocol header (HAProxy v1 text or v2 binary) from
+       load balancers whose address is in ``trustedCidrs`` (CIDRs or single
+       IPs), so sessions, authentication callbacks, limits and logs see the
+       real client address. ``mode``: ``"off"`` (default), ``"optional"``
+       (trusted peers may send a header; connections without one keep the
+       TCP peer) or ``"required"`` (only trusted peers that send a header
+       are served; everything else is closed before the SSH handshake). A
+       header from an untrusted peer is never honoured. -#
+    func withProxyProtocol(self, mode: str, trustedCidrs: list[str]) -> SftpConfig {
+        self.proxyProtocol = mode
+        self.proxyTrusted = trustedCidrs
         return self
     }
 

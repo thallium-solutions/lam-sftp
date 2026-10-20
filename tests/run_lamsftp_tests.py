@@ -36,7 +36,7 @@ def _check_compiler() -> bool:
         print(f"Error: invalid {COMPILER} version: {proc.stdout.strip()!r}", file=sys.stderr)
         return False
     version = tuple(int(part) for part in match.groups())
-    if version < MIN_COMPILER_VERSION or version >= (3, 0, 0):
+    if version < MIN_COMPILER_VERSION or version >= (4, 0, 0):
         required = ".".join(str(part) for part in MIN_COMPILER_VERSION)
         print(
             f"Error: {COMPILER} {proc.stdout.strip()} is incompatible; "

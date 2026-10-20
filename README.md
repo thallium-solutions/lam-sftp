@@ -74,7 +74,7 @@ from @lam/sftp import SftpServer, SftpConfig, SftpHandlers
 ## Requirements
 
 - Lammergeier compiler (`lamc`) **1.18.0 or newer** within the compatible
-  `1.x` and `2.x` lines (`>=1.18, <3`).
+  `1.x` and `2.x` lines (`>=1.18, <4`).
 - `@lam/ssh` 3.0.2, resolved transitively from its pinned Git release.
 - Go **1.25.0 or newer**, required by `github.com/pkg/sftp v1.13.11`.
 
@@ -529,6 +529,7 @@ config: SftpConfig = (SftpConfig(hostKey)
     .withAuthRateLimit(20, 40)
     .withAddressAuthRateLimit(120, 60)
     .withAddressLockout(50, 600)
+    .withProxyProtocol("optional", ["10.0.0.0/8"])
     .productionMode())
 ```
 
@@ -559,6 +560,19 @@ start without bounded reads/writes, idle and authentication limits, and
   rejected key counts as a failed attempt). The state is per server process,
   bounded in size, and available as `server.addressLimiter`
   (`SftpAddressLimiter`: `allow`, `recordFailure`, `isLocked`, `unlock`).
+- `withProxyProtocol(mode, trustedCidrs)` accepts a PROXY protocol header
+  (HAProxy v1 text or v2 binary, TCP over IPv4/IPv6; v2 TLVs are skipped)
+  from load balancers in `trustedCidrs`, so sessions (`remoteAddress`),
+  authentication callbacks, the per-address limits and logs see the real
+  client. `"optional"` honours a header when a trusted peer sends one and
+  keeps the TCP peer otherwise; `"required"` closes connections from
+  untrusted peers and trusted peers without a header before the SSH
+  handshake. A header sent by an untrusted peer is never honoured (the SSH
+  handshake skips it as a pre-version line). v2 `LOCAL` (health checks) and
+  v1 `UNKNOWN` keep the load balancer's address. Malformed headers close the
+  connection; both count as `connectionsRejected`. Configure the balancer to
+  send the header (HAProxy `send-proxy`/`send-proxy-v2`, AWS NLB proxy
+  protocol v2, nginx `proxy_protocol on` in the stream module).
 - Multiple host keys permit algorithm migration without abruptly changing the
   server identity for every client.
 - Unhandled lifecycle errors are written through stdlib `lamlog.Log`; an

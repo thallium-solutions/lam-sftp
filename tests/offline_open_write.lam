@@ -87,7 +87,7 @@ func run() -> Result[bool] {
     _ = server.onWrite(store)
     _ = server.onOpenWrite(checkOpen)
     _ = server.listenBackground()?
-    address: str = server.BoundAddress
+    address: str = server.boundAddress
     results: list[str] = []
     go! {
         c, err := openWriteDial(address)
@@ -111,7 +111,7 @@ func run() -> Result[bool] {
     _ = readonly.onWrite(store)
     _ = readonly.setReadOnly(true)
     _ = readonly.listenBackground()?
-    roAddress: str = readonly.BoundAddress
+    roAddress: str = readonly.boundAddress
     roResult: str = ""
     go! {
         ro, dialErr := openWriteDial(roAddress)

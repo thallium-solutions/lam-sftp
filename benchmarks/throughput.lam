@@ -205,7 +205,7 @@ func main() {
         flowsText = "1,2,4,8"
     }
     size: int = sizeBytes()
-    print(f"payload {size / 1048576} MiB per session and direction")
+    print(f"payload {size // 1048576} MiB per session and direction")
     go! {
         if path := os.Getenv("BENCH_PROFILE"); path != "" {
             f, err := os.Create(path)

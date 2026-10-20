@@ -1,0 +1,165 @@
+# PROXY protocol (HAProxy v1 text and v2 binary) from trusted load
+# balancers: authentication callbacks and limits see the client address of
+# the header; untrusted peers and malformed headers are not honoured.
+#
+# expect: invalid-mode=false
+# expect: no-trusted=false
+# expect: bad-cidr=false
+# expect: v1=ok 203.0.113.7
+# expect: v2-ipv4=ok 198.51.100.9
+# expect: v2-ipv6=ok 2001:db8::42
+# expect: v2-local=ok 127.0.0.1
+# expect: plain-optional=ok 127.0.0.1
+# expect: malformed=refused
+# expect: untrusted-header=ok 127.0.0.2
+# expect: required-plain=refused
+# expect: required-header=ok 203.0.113.8
+# expect: required-untrusted=refused
+# expect: lockout-uses-client=refused
+
+from @lam/sftp import SftpAuth, SftpConfig, SftpKey, SftpServer
+from lamerrors import Result
+from lamconcurrency import Mutex
+
+go! {
+    import (
+        "encoding/binary"
+        "net"
+        "time"
+
+        "golang.org/x/crypto/ssh"
+    )
+
+    // proxyDial connects from local (127.0.0.x), writes header, then signs in.
+    func proxyDial(address, local string, header []byte, password string) string {
+        dialer := &net.Dialer{Timeout: 5 * time.Second, LocalAddr: &net.TCPAddr{IP: net.ParseIP(local)}}
+        raw, err := dialer.Dial("tcp", address)
+        if err != nil {
+            return "dial: " + err.Error()
+        }
+        if len(header) > 0 {
+            raw.Write(header)
+        }
+        cfg := &ssh.ClientConfig{User: "u", Auth: []ssh.AuthMethod{ssh.Password(password)}, HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: 5 * time.Second}
+        conn, chans, reqs, err := ssh.NewClientConn(raw, address, cfg)
+        if err != nil {
+            raw.Close()
+            return "refused"
+        }
+        ssh.NewClient(conn, chans, reqs).Close()
+        return "ok"
+    }
+
+    func proxyV2(command byte, family byte, src net.IP, dst net.IP, sport int, dport int) []byte {
+        out := []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, 0x20 | command, family}
+        var body []byte
+        if family == 0x11 {
+            body = append(append(body, src.To4()...), dst.To4()...)
+        } else if family == 0x21 {
+            body = append(append(body, src.To16()...), dst.To16()...)
+        }
+        if len(body) > 0 {
+            body = binary.BigEndian.AppendUint16(body, uint16(sport))
+            body = binary.BigEndian.AppendUint16(body, uint16(dport))
+        }
+        body = append(body, 0x04, 0x00, 0x01, 0x00) // a TLV that must be skipped
+        out = binary.BigEndian.AppendUint16(out, uint16(len(body)))
+        return append(out, body...)
+    }
+}
+
+class Seen {
+    func init(self) {
+        self.mu: Mutex = Mutex()
+        self.last: str = ""
+    }
+
+    func check(self, auth: SftpAuth) -> bool {
+        host: str = auth.remoteAddress
+        if host.startsWith("[") {
+            host = host[1:host.index("]")]
+        } elif host.contains(":") {
+            host = host[0:host.lastIndex(":")]
+        }
+        self.mu.lock()
+        self.last = host
+        self.mu.unlock()
+        return auth.password == "right"
+    }
+
+    func get(self) -> str {
+        self.mu.lock()
+        out: str = self.last
+        self.mu.unlock()
+        return out
+    }
+}
+
+func start(mode: str, trusted: list[str], seen: Seen, lockout: int) -> Result[SftpServer] {
+    config: SftpConfig = SftpConfig(SftpKey.generate()?, "127.0.0.1:0").withProxyProtocol(mode, trusted)
+    if lockout > 0 {
+        config = config.withAddressLockout(lockout, 600)
+    }
+    server: SftpServer = SftpServer(config)
+    _ = server.onPasswordAuth(seen.check)
+    _ = server.listenBackground()?
+    return Result.Ok(server)
+}
+
+func dial(server: SftpServer, seen: Seen, local: str, header: any, password: str) -> str {
+    address: str = server.boundAddress
+    outcome: str = go!(proxyDial(address, local, header.([]byte), password))
+    if outcome != "ok" {
+        return outcome
+    }
+    return outcome + " " + seen.get()
+}
+
+func run() -> Result[bool] {
+    key: str = SftpKey.generate()?
+    print(f"invalid-mode={SftpConfig(key, '127.0.0.1:0').withProxyProtocol('sometimes', ['127.0.0.1']).validate().ok()}")
+    print(f"no-trusted={SftpConfig(key, '127.0.0.1:0').withProxyProtocol('optional', []).validate().ok()}")
+    print(f"bad-cidr={SftpConfig(key, '127.0.0.1:0').withProxyProtocol('optional', ['10.0.0.0/33']).validate().ok()}")
+
+    seen: Seen = Seen()
+    # Only 127.0.0.1 is a trusted load balancer; 127.0.0.2 is a client.
+    optional: SftpServer = start("optional", ["127.0.0.1/32"], seen, 0)?
+    v1: any = go!([]byte("PROXY TCP4 203.0.113.7 10.0.0.1 51000 22\r\n"))
+    print("v1=" + dial(optional, seen, "127.0.0.1", v1, "right"))
+    v2: any = go!(proxyV2(0x1, 0x11, net.ParseIP("198.51.100.9"), net.ParseIP("10.0.0.1"), 40000, 22))
+    print("v2-ipv4=" + dial(optional, seen, "127.0.0.1", v2, "right"))
+    v6: any = go!(proxyV2(0x1, 0x21, net.ParseIP("2001:db8::42"), net.ParseIP("2001:db8::1"), 40001, 22))
+    print("v2-ipv6=" + dial(optional, seen, "127.0.0.1", v6, "right"))
+    local: any = go!(proxyV2(0x0, 0x00, nil, nil, 0, 0))
+    print("v2-local=" + dial(optional, seen, "127.0.0.1", local, "right"))
+    none: any = go!([]byte{})
+    print("plain-optional=" + dial(optional, seen, "127.0.0.1", none, "right"))
+    broken: any = go!([]byte("PROXY TCP4 not-an-ip 10.0.0.1 1 22\r\n"))
+    print("malformed=" + dial(optional, seen, "127.0.0.1", broken, "right"))
+    print("untrusted-header=" + dial(optional, seen, "127.0.0.2", v1, "right"))
+    optional.close()
+
+    required: SftpServer = start("required", ["127.0.0.1"], seen, 0)?
+    print("required-plain=" + dial(required, seen, "127.0.0.1", none, "right"))
+    v1b: any = go!([]byte("PROXY TCP4 203.0.113.8 10.0.0.1 51000 22\r\n"))
+    print("required-header=" + dial(required, seen, "127.0.0.1", v1b, "right"))
+    print("required-untrusted=" + dial(required, seen, "127.0.0.2", v1b, "right"))
+    required.close()
+
+    # Lockouts count the client of the header, not the load balancer: two
+    # failures from 203.0.113.50 lock it, another client still signs in.
+    locking: SftpServer = start("optional", ["127.0.0.1"], seen, 2)?
+    attacker: any = go!([]byte("PROXY TCP4 203.0.113.50 10.0.0.1 1 22\r\n"))
+    _ = dial(locking, seen, "127.0.0.1", attacker, "wrong")
+    _ = dial(locking, seen, "127.0.0.1", attacker, "wrong")
+    print("lockout-uses-client=" + dial(locking, seen, "127.0.0.1", attacker, "right"))
+    locking.close()
+    return Result.Ok(true)
+}
+
+func main() {
+    r: Result[bool] = run()
+    if not r.ok() {
+        print(f"error: {r.error}")
+    }
+}

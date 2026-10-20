@@ -67,7 +67,7 @@ func run() -> Result[bool] {
     server: SftpServer = SftpServer(SftpConfig(SftpKey.generate()?, "127.0.0.1:0"))
     _ = server.onPasswordAuth(tagAccount)
     _ = server.listenBackground()?
-    address: str = server.BoundAddress
+    address: str = server.boundAddress
     alice: any = None
     bob: any = None
     go! {

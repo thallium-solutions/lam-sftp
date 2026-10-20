@@ -146,7 +146,7 @@ class SftpRequest {
         if deadlineMs < 0 {
             return Result.Ok(0)
         }
-        return Result.Ok(deadlineMs / 1000)
+        return Result.Ok(deadlineMs // 1000)
     }
 
     func isReadOperation(self) -> bool {

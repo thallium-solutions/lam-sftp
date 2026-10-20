@@ -2,6 +2,21 @@
 
 All notable changes to `@lam/sftp` are documented here.
 
+## [3.5.0] - 2026-10-20
+
+### Added
+
+- PROXY protocol v1/v2 behind load balancers: `SftpConfig.withProxyProtocol(mode,
+  trustedCidrs)` (`off`, `optional`, `required`); sessions, authentication
+  callbacks, per-address limits and logs see the client address of the
+  header. Headers from untrusted peers are never honoured.
+
+### Changed
+
+- Compatible with `lamc` 3.x: `compatibility.lamc = ">=1.18, <4"` (test runner too).
+- Pins `@lam/ssh` 3.0.3.
+- Integer divisions use `//` (lamc 3.0 makes `/` a float division).
+
 ## [3.4.0] - 2026-10-19
 
 ### Added
