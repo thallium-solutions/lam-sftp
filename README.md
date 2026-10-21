@@ -185,6 +185,37 @@ see a changed key at step 2 and must update their pin manually. For those, run
 a second listener with the old key during the transition, or tell them the new
 fingerprint in advance.
 
+### Host keys per destination (dedicated endpoints)
+
+One server can answer several addresses with different host keys. Examples:
+one IP address per customer behind a load balancer, or a customer who moved
+from their own SFTP server and keeps its host key, so their partners see no
+change. `onHostKeysFor` receives the address the client connected to and
+returns the PEM private keys to offer there, or `[]` for the configured
+ones:
+
+```lammergeier
+func keysFor(localAddress: str) -> list[str] {
+    if localAddress == "203.0.113.10:22" {
+        return [acmeHostKey]
+    }
+    return []
+}
+
+_ = server.onHostKeysFor(keysFor)
+```
+
+**Which address.** Behind a load balancer sending PROXY headers
+(`withProxyProtocol`), it is the header's destination; otherwise it is the
+listening address.
+
+**Authorization.** `SftpAuth.localAddress` carries the same address, for
+example to admit only one customer's users on their endpoint.
+
+**Keys.** The chosen keys are also the ones announced after authentication.
+Parsed keys are cached; keys that cannot be parsed are skipped, and the
+configured keys are used when none is left.
+
 ## Quick start with callbacks
 
 Every handler can be a named function or a lambda. The example below exposes

@@ -53,6 +53,10 @@ class SftpAuth {
     func init(self) {
         self.username: str = ""
         self.remoteAddress: str = ""
+        #- The address the client connected to: the server's listening
+           address, or the destination of the PROXY header from a trusted
+           load balancer (dedicated endpoints, ``onHostKeysFor``). -#
+        self.localAddress: str = ""
         self.method: str = ""
         self.password: str = ""
         self.publicKey: str = ""

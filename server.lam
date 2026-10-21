@@ -47,6 +47,8 @@ class SftpServer {
         self.publicKeyAuth: func(SftpAuth) -> bool = lambda(_auth: SftpAuth) -> bool: false
         self.hasPasswordAuth: bool = false
         self.hasPublicKeyAuth: bool = false
+        self.hostKeysFor: func(str) -> list[str] = lambda(_address: str) -> list[str]: []
+        self.hasHostKeysFor: bool = false
         self.readyCallbacks: list[func(SftpServer)] = []
         self.listenCallbacks: list[func(SftpServer)] = []
         self.closeCallbacks: list[func(SftpServer)] = []
@@ -98,6 +100,18 @@ class SftpServer {
     func onPasswordAuth(self, callback: func(SftpAuth) -> bool) -> SftpServer {
         self.passwordAuth = callback
         self.hasPasswordAuth = true
+        return self
+    }
+
+    #- Host keys per destination: ``callback(localAddress)`` returns the
+       PEM private keys to present on a connection to that address (the
+       listening address, or the PROXY destination from a trusted load
+       balancer), or [] for the configured ones. Lets one server act as
+       dedicated endpoints with their own host keys. Called once per
+       connection before the handshake; parsed keys are cached. -#
+    func onHostKeysFor(self, callback: func(str) -> list[str]) -> SftpServer {
+        self.hostKeysFor = callback
+        self.hasHostKeysFor = true
         return self
     }
 
@@ -392,6 +406,7 @@ class SftpServer {
                 sshConfig.Config.MACs = append([]string(nil), s.Config.Macs...)
             }
             var hostSigners []ssh.Signer
+            var defaultSigners []ssh.Signer
             parseKey := func(keyText string) (ssh.Signer, error) {
                 if s.Config.HostKeyPassphrase == "" {
                     return ssh.ParsePrivateKey([]byte(keyText))
@@ -403,7 +418,7 @@ class SftpServer {
                 if err != nil {
                     return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("SftpListenError", fmt.Sprintf("parse host key: %v", err), nil))
                 }
-                sshConfig.AddHostKey(signer)
+                defaultSigners = append(defaultSigners, signer)
                 hostSigners = append(hostSigners, signer)
             }
             for _, keyText := range s.Config.AnnouncedHostKeys {
@@ -418,6 +433,7 @@ class SftpServer {
                     auth := NewSftpAuth()
                     auth.Username = meta.User()
                     auth.RemoteAddress = meta.RemoteAddr().String()
+                    auth.LocalAddress = meta.LocalAddr().String()
                     auth.Method = "password"
                     auth.Password = string(password)
                     defer func() {
@@ -437,6 +453,7 @@ class SftpServer {
                     auth := NewSftpAuth()
                     auth.Username = meta.User()
                     auth.RemoteAddress = meta.RemoteAddr().String()
+                    auth.LocalAddress = meta.LocalAddr().String()
                     auth.Method = "publicKey"
                     auth.PublicKey = strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
                     auth.Fingerprint = ssh.FingerprintSHA256(key)
@@ -455,6 +472,12 @@ class SftpServer {
                     }
                     return lamSftpPermissions(auth), nil
                 }
+            }
+            // Configuration without host keys: per-destination keys
+            // (onHostKeysFor) are added to copies of it.
+            template := *sshConfig
+            for _, signer := range defaultSigners {
+                sshConfig.AddHostKey(signer)
             }
             listener, err := net.Listen("tcp", s.Config.Address)
             if err != nil {
@@ -475,6 +498,15 @@ class SftpServer {
                 maxConnections: s.Config.MaxConnections,
                 idleTimeout:    time.Duration(s.Config.IdleTimeoutMs) * time.Millisecond,
                 hostSigners:    hostSigners,
+                template:       template,
+                signerCache:    make(map[string]ssh.Signer),
+                parseKey:       parseKey,
+            }
+            if s.HasHostKeysFor {
+                runtime.keysFor = s.HostKeysFor
+            }
+            if s.Config.AdaptiveCiphers {
+                runtime.fallbackCiphers = append([]string(nil), s.Config.FallbackCiphers...)
             }
             s._raw = runtime
             s.BoundAddress = listener.Addr().String()

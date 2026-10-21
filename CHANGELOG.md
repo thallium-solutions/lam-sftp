@@ -2,6 +2,20 @@
 
 All notable changes to `@lam/sftp` are documented here.
 
+## [3.7.0] - 2026-11-12
+
+### Added
+
+- `onHostKeysFor(callback)`: host keys chosen per connection by the address
+  the client connected to (the PROXY destination behind a trusted load
+  balancer, else the listening address), for dedicated endpoints and keeping
+  a migrated server's host key. The chosen keys are announced
+  (`hostkeys-00@openssh.com`) instead of the configured ones.
+- `SftpAuth.localAddress`: the destination address, for authorization per
+  endpoint.
+- The PROXY protocol reader keeps the destination address of v1 and v2
+  headers.
+
 ## [3.6.0] - 2026-10-21
 
 ### Added

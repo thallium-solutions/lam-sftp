@@ -418,6 +418,14 @@ go! {
         idleTimeout    time.Duration
         // Served and announced host keys (hostkeys-00 / hostkeys-prove-00).
         hostSigners    []ssh.Signer
+        // Per-destination host keys (onHostKeysFor): the configuration
+        // without keys, the callback, parsed keys by PEM text.
+        template        ssh.ServerConfig
+        keysFor         func(string) []string
+        fallbackCiphers []string
+        signerMu        sync.Mutex
+        signerCache     map[string]ssh.Signer
+        parseKey        func(string) (ssh.Signer, error)
         wg             sync.WaitGroup
     }
 
@@ -1405,12 +1413,54 @@ go! {
         return false
     }
 
-    // lamSftpProxyConn reports the client address from the PROXY header
-    // and replays the bytes read past it.
+    // lamSftpProxyConn reports the client and destination addresses from
+    // the PROXY header and replays the bytes read past it.
     type lamSftpProxyConn struct {
         net.Conn
         remote net.Addr
+        local  net.Addr
         prefix []byte
+    }
+
+    func (c *lamSftpProxyConn) LocalAddr() net.Addr {
+        if c.local != nil {
+            return c.local
+        }
+        return c.Conn.LocalAddr()
+    }
+
+    // signersFor returns the host keys a callback chose for a destination
+    // (nil: the configured ones). Unparsable keys are skipped.
+    func (r *lamSftpRuntime) signersFor(local string) []ssh.Signer {
+        if r.keysFor == nil {
+            return nil
+        }
+        var keys []string
+        func() {
+            defer func() { _ = recover() }()
+            keys = r.keysFor(local)
+        }()
+        var out []ssh.Signer
+        for _, text := range keys {
+            r.signerMu.Lock()
+            signer, ok := r.signerCache[text]
+            r.signerMu.Unlock()
+            if !ok {
+                parsed, err := r.parseKey(text)
+                if err != nil {
+                    continue
+                }
+                signer = parsed
+                r.signerMu.Lock()
+                if len(r.signerCache) > 4096 {
+                    r.signerCache = make(map[string]ssh.Signer)
+                }
+                r.signerCache[text] = signer
+                r.signerMu.Unlock()
+            }
+            out = append(out, signer)
+        }
+        return out
     }
 
     func (c *lamSftpProxyConn) Read(p []byte) (int, error) {
@@ -1430,15 +1480,15 @@ go! {
     }
 
     // lamSftpReadProxyHeader reads a PROXY v1 or v2 header from conn. It
-    // returns the client address (nil for v2 LOCAL / v1 UNKNOWN: keep the
-    // peer), the bytes read after the header, whether a header was present,
-    // and an error for a malformed header.
-    func lamSftpReadProxyHeader(conn net.Conn) (net.Addr, []byte, bool, error) {
+    // returns the client and destination addresses (nil for v2 LOCAL / v1
+    // UNKNOWN: keep the peer), the bytes read after the header, whether a
+    // header was present, and an error for a malformed header.
+    func lamSftpReadProxyHeader(conn net.Conn) (net.Addr, net.Addr, []byte, bool, error) {
         reader := bufio.NewReaderSize(conn, 536)
         first, err := reader.Peek(5)
         if err != nil {
             rest, _ := reader.Peek(reader.Buffered())
-            return nil, append([]byte(nil), rest...), false, nil
+            return nil, nil, append([]byte(nil), rest...), false, nil
         }
         leftover := func() []byte {
             rest, _ := reader.Peek(reader.Buffered())
@@ -1447,60 +1497,62 @@ go! {
         if string(first) == "PROXY" {
             line, err := reader.ReadSlice('\n')
             if err != nil || len(line) > 107 || !strings.HasSuffix(string(line), "\r\n") {
-                return nil, nil, true, fmt.Errorf("malformed PROXY v1 header")
+                return nil, nil, nil, true, fmt.Errorf("malformed PROXY v1 header")
             }
             fields := strings.Fields(strings.TrimSpace(string(line)))
             if len(fields) >= 2 && fields[1] == "UNKNOWN" {
-                return nil, leftover(), true, nil
+                return nil, nil, leftover(), true, nil
             }
             if len(fields) != 6 || (fields[1] != "TCP4" && fields[1] != "TCP6") {
-                return nil, nil, true, fmt.Errorf("malformed PROXY v1 header")
+                return nil, nil, nil, true, fmt.Errorf("malformed PROXY v1 header")
             }
             ip := net.ParseIP(fields[2])
             port, perr := strconv.Atoi(fields[4])
-            if ip == nil || perr != nil || port < 0 || port > 65535 {
-                return nil, nil, true, fmt.Errorf("malformed PROXY v1 address")
+            dip := net.ParseIP(fields[3])
+            dport, derr := strconv.Atoi(fields[5])
+            if ip == nil || perr != nil || port < 0 || port > 65535 || dip == nil || derr != nil || dport < 0 || dport > 65535 {
+                return nil, nil, nil, true, fmt.Errorf("malformed PROXY v1 address")
             }
-            return &net.TCPAddr{IP: ip, Port: port}, leftover(), true, nil
+            return &net.TCPAddr{IP: ip, Port: port}, &net.TCPAddr{IP: dip, Port: dport}, leftover(), true, nil
         }
         if bytes.Equal(first, lamSftpProxyV2Signature[:5]) {
             head, err := reader.Peek(16)
             if err != nil || !bytes.Equal(head[:12], lamSftpProxyV2Signature) {
-                return nil, nil, true, fmt.Errorf("malformed PROXY v2 header")
+                return nil, nil, nil, true, fmt.Errorf("malformed PROXY v2 header")
             }
             version, command, family := head[12]>>4, head[12]&0x0F, head[13]
             length := int(binary.BigEndian.Uint16(head[14:16]))
             if version != 2 || length > 520 {
-                return nil, nil, true, fmt.Errorf("unsupported PROXY v2 header")
+                return nil, nil, nil, true, fmt.Errorf("unsupported PROXY v2 header")
             }
             full := make([]byte, 16+length)
             if _, err := io.ReadFull(reader, full); err != nil {
-                return nil, nil, true, fmt.Errorf("truncated PROXY v2 header")
+                return nil, nil, nil, true, fmt.Errorf("truncated PROXY v2 header")
             }
             body := full[16:]
             if command == 0x0 {
-                return nil, leftover(), true, nil
+                return nil, nil, leftover(), true, nil
             }
             if command != 0x1 {
-                return nil, nil, true, fmt.Errorf("unsupported PROXY v2 command")
+                return nil, nil, nil, true, fmt.Errorf("unsupported PROXY v2 command")
             }
             switch family {
             case 0x11: // TCP over IPv4
                 if len(body) < 12 {
-                    return nil, nil, true, fmt.Errorf("truncated PROXY v2 address")
+                    return nil, nil, nil, true, fmt.Errorf("truncated PROXY v2 address")
                 }
-                return &net.TCPAddr{IP: net.IP(append([]byte(nil), body[0:4]...)), Port: int(binary.BigEndian.Uint16(body[8:10]))}, leftover(), true, nil
+                return &net.TCPAddr{IP: net.IP(append([]byte(nil), body[0:4]...)), Port: int(binary.BigEndian.Uint16(body[8:10]))}, &net.TCPAddr{IP: net.IP(append([]byte(nil), body[4:8]...)), Port: int(binary.BigEndian.Uint16(body[10:12]))}, leftover(), true, nil
             case 0x21: // TCP over IPv6
                 if len(body) < 36 {
-                    return nil, nil, true, fmt.Errorf("truncated PROXY v2 address")
+                    return nil, nil, nil, true, fmt.Errorf("truncated PROXY v2 address")
                 }
-                return &net.TCPAddr{IP: net.IP(append([]byte(nil), body[0:16]...)), Port: int(binary.BigEndian.Uint16(body[32:34]))}, leftover(), true, nil
+                return &net.TCPAddr{IP: net.IP(append([]byte(nil), body[0:16]...)), Port: int(binary.BigEndian.Uint16(body[32:34]))}, &net.TCPAddr{IP: net.IP(append([]byte(nil), body[16:32]...)), Port: int(binary.BigEndian.Uint16(body[34:36]))}, leftover(), true, nil
             default:
                 // UNSPEC / UDP / unix: keep the peer address.
-                return nil, leftover(), true, nil
+                return nil, nil, leftover(), true, nil
             }
         }
-        return nil, leftover(), false, nil
+        return nil, nil, leftover(), false, nil
     }
 
     // lamSftpReplayConn hands bytes already read (the client's version line)
@@ -1618,12 +1670,12 @@ go! {
         if mode := server.Config.ProxyProtocol; mode != "" && mode != "off" {
             trusted, _ := lamSftpParseCidrs(server.Config.ProxyTrusted)
             if lamSftpPeerTrusted(raw.RemoteAddr(), trusted) {
-                remote, rest, present, err := lamSftpReadProxyHeader(raw)
+                remote, local, rest, present, err := lamSftpReadProxyHeader(raw)
                 if err != nil || (!present && mode == "required") {
                     server.Metrics.ConnectionsRejected.Increment()
                     return
                 }
-                base = &lamSftpProxyConn{Conn: raw, remote: remote, prefix: rest}
+                base = &lamSftpProxyConn{Conn: raw, remote: remote, local: local, prefix: rest}
             } else if mode == "required" {
                 server.Metrics.ConnectionsRejected.Increment()
                 return
@@ -1632,12 +1684,27 @@ go! {
         // Adaptive ciphers: choose the offer from the client's version line
         // (read here and replayed to the handshake).
         var handshakeConn net.Conn = base
+        fallback := false
         if runtime.fallbackConfig != nil {
             version, replay := lamSftpPeekClientVersion(base, time.Second)
             handshakeConn = &lamSftpReplayConn{Conn: base, prefix: replay}
             if !lamSftpGcmCapable(version) {
                 sshConfig = runtime.fallbackConfig
+                fallback = true
             }
+        }
+        // Dedicated endpoints: host keys chosen by the destination address.
+        announced := runtime.hostSigners
+        if signers := runtime.signersFor(base.LocalAddr().String()); len(signers) > 0 {
+            chosen := runtime.template
+            if fallback {
+                chosen.Config.Ciphers = append([]string(nil), runtime.fallbackCiphers...)
+            }
+            for _, signer := range signers {
+                chosen.AddHostKey(signer)
+            }
+            sshConfig = &chosen
+            announced = signers
         }
         connection, channels, requests, err := ssh.NewServerConn(handshakeConn, sshConfig)
         if err != nil {
@@ -1650,8 +1717,8 @@ go! {
         }
         defer connection.Close()
         runtime.track(raw, connection)
-        lamSftpAnnounceHostKeys(connection, runtime.hostSigners)
-        go lamSftpGlobalRequests(connection, requests, runtime.hostSigners)
+        lamSftpAnnounceHostKeys(connection, announced)
+        go lamSftpGlobalRequests(connection, requests, announced)
         lamSftpServeChannels(connection, channels, server)
     }
 }

@@ -1,0 +1,184 @@
+# Dedicated endpoints: onHostKeysFor chooses the host keys by the address a
+# client connected to (the PROXY destination from a trusted load balancer,
+# or the listening address), the announcement lists those keys, and
+# SftpAuth.localAddress carries the destination for authorization.
+#
+# expect: default=default
+# expect: dedicated=dedicated announced=dedicated
+# expect: local-address=10.0.0.5:22
+# expect: v1-dedicated=dedicated
+# expect: other-destination=default
+# expect: unknown-key-falls-back=default
+# expect: adaptive-dedicated=dedicated
+# expect: callback-per-connection=true
+
+from @lam/sftp import SftpAuth, SftpConfig, SftpKey, SftpServer
+from lamerrors import Result
+from lamconcurrency import Mutex
+
+go! {
+    import (
+        "bytes"
+        "encoding/binary"
+        "fmt"
+        "net"
+        "time"
+
+        "golang.org/x/crypto/ssh"
+    )
+
+    // endpointProbe sends header, signs in and reports the handshake key
+    // and the announced keys ("default", "dedicated" or "other").
+    func endpointProbe(address string, header []byte, version string, keys map[string]ssh.PublicKey) []string {
+        name := func(k []byte) string {
+            for label, key := range keys {
+                if bytes.Equal(k, key.Marshal()) {
+                    return label
+                }
+            }
+            return "other"
+        }
+        var handshake string
+        cfg := &ssh.ClientConfig{User: "u", Auth: []ssh.AuthMethod{ssh.Password("x")}, Timeout: 5 * time.Second, ClientVersion: version,
+            HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error { handshake = name(key.Marshal()); return nil }}
+        raw, err := net.DialTimeout("tcp", address, 5*time.Second)
+        if err != nil {
+            return []string{"dial: " + err.Error(), ""}
+        }
+        if len(header) > 0 {
+            raw.Write(header)
+        }
+        conn, _, reqs, err := ssh.NewClientConn(raw, address, cfg)
+        if err != nil {
+            return []string{"handshake: " + err.Error(), ""}
+        }
+        defer conn.Close()
+        announced := ""
+        select {
+        case req := <-reqs:
+            rest := req.Payload
+            for len(rest) > 0 {
+                var item struct {
+                    Key  []byte
+                    Rest []byte `ssh:"rest"`
+                }
+                if ssh.Unmarshal(rest, &item) != nil {
+                    break
+                }
+                if announced != "" {
+                    announced += ","
+                }
+                announced += name(item.Key)
+                rest = item.Rest
+            }
+        case <-time.After(2 * time.Second):
+        }
+        return []string{handshake, announced}
+    }
+
+    func endpointV2(dst string, dport int) []byte {
+        out := []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, 0x21, 0x11}
+        body := append(append([]byte{}, net.ParseIP("203.0.113.9").To4()...), net.ParseIP(dst).To4()...)
+        body = binary.BigEndian.AppendUint16(body, 40000)
+        body = binary.BigEndian.AppendUint16(body, uint16(dport))
+        out = binary.BigEndian.AppendUint16(out, uint16(len(body)))
+        return append(out, body...)
+    }
+
+    func endpointV1(dst string, dport int) []byte {
+        return []byte(fmt.Sprintf("PROXY TCP4 203.0.113.9 %s 40000 %d\r\n", dst, dport))
+    }
+
+    func endpointPublic(pem string) ssh.PublicKey {
+        signer, err := ssh.ParsePrivateKey([]byte(pem))
+        if err != nil {
+            panic(err)
+        }
+        return signer.PublicKey()
+    }
+}
+
+class Endpoints {
+    func init(self, dedicated: str) {
+        self.mu: Mutex = Mutex()
+        self.dedicated: str = dedicated
+        self.lastLocal: str = ""
+        self.lookups: int = 0
+    }
+
+    func keysFor(self, local: str) -> list[str] {
+        self.mu.lock()
+        self.lookups += 1
+        self.mu.unlock()
+        if local == "10.0.0.5:22" {
+            return [self.dedicated]
+        }
+        if local == "10.0.0.6:22" {
+            return ["not a key"]
+        }
+        return []
+    }
+
+    func check(self, auth: SftpAuth) -> bool {
+        self.mu.lock()
+        self.lastLocal = auth.localAddress
+        self.mu.unlock()
+        return true
+    }
+}
+
+func probe(server: SftpServer, header: str, defaultKey: str, dedicatedKey: str, version: str) -> list[str] {
+    address: str = server.boundAddress
+    out: list[str] = []
+    go! {
+        keys := map[string]ssh.PublicKey{"default": endpointPublic(defaultKey), "dedicated": endpointPublic(dedicatedKey)}
+        var raw []byte
+        switch header {
+        case "v2-dedicated":
+            raw = endpointV2("10.0.0.5", 22)
+        case "v1-dedicated":
+            raw = endpointV1("10.0.0.5", 22)
+        case "v2-other":
+            raw = endpointV2("10.0.0.7", 22)
+        case "v2-badkey":
+            raw = endpointV2("10.0.0.6", 22)
+        }
+        out = endpointProbe(address, raw, version, keys)
+    }
+    return out
+}
+
+func run() -> Result[bool] {
+    defaultKey: str = SftpKey.generate()?
+    dedicatedKey: str = SftpKey.generate()?
+    endpoints: Endpoints = Endpoints(dedicatedKey)
+    config: SftpConfig = SftpConfig(defaultKey, "127.0.0.1:0").withProxyProtocol("optional", ["127.0.0.0/8"])
+    server: SftpServer = SftpServer(config)
+    _ = server.onPasswordAuth(endpoints.check)
+    _ = server.onHostKeysFor(endpoints.keysFor)
+    _ = server.listenBackground()?
+    plain: list[str] = probe(server, "", defaultKey, dedicatedKey, "")
+    print(f"default={plain[0]}")
+    dedicated: list[str] = probe(server, "v2-dedicated", defaultKey, dedicatedKey, "")
+    print(f"dedicated={dedicated[0]} announced={dedicated[1]}")
+    print(f"local-address={endpoints.lastLocal}")
+    print(f"v1-dedicated={probe(server, 'v1-dedicated', defaultKey, dedicatedKey, '')[0]}")
+    print(f"other-destination={probe(server, 'v2-other', defaultKey, dedicatedKey, '')[0]}")
+    print(f"unknown-key-falls-back={probe(server, 'v2-badkey', defaultKey, dedicatedKey, '')[0]}")
+    server.shutdown()
+    adaptive: SftpServer = SftpServer(SftpConfig(defaultKey, "127.0.0.1:0").withProxyProtocol("optional", ["127.0.0.0/8"]).withAdaptiveCiphers(SftpConfig.fastCiphers()))
+    _ = adaptive.onPasswordAuth(endpoints.check)
+    _ = adaptive.onHostKeysFor(endpoints.keysFor)
+    _ = adaptive.listenBackground()?
+    print(f"adaptive-dedicated={probe(adaptive, 'v2-dedicated', defaultKey, dedicatedKey, 'SSH-2.0-PuTTY_Release_0.70')[0]}")
+    adaptive.shutdown()
+    print(f"callback-per-connection={endpoints.lookups >= 6}")
+    return Result.Ok(true)
+}
+
+func main() {
+    r: Result[bool] = run()
+    if not r.ok() {
+        print(f"error: {r.error}")
+    }
+}
