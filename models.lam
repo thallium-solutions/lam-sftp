@@ -58,6 +58,19 @@ class SftpAuth {
         self.publicKey: str = ""
         self.fingerprint: str = ""
         self.meta: dict[str, str] = {}
+        #- OpenSSH user certificate (``withUserCertificates``): already
+           verified (signature, validity window, ``username`` among the
+           principals, ``source-address``); ``publicKey`` / ``fingerprint``
+           are the certified key, ``certAuthority*`` the signing CA. -#
+        self.certificate: bool = false
+        self.certKeyId: str = ""
+        self.certSerial: int = 0
+        self.certPrincipals: list[str] = []
+        self.certAuthority: str = ""
+        self.certAuthorityFingerprint: str = ""
+        self.certValidAfter: int = 0
+        #- 0 = no expiry. -#
+        self.certValidBefore: int = 0
     }
 
     func set(self, key: str, value: str) -> SftpAuth {

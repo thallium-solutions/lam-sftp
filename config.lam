@@ -27,6 +27,14 @@ class SftpConfig {
     func init(self, hostKey: str = "", address: str = "127.0.0.1:2022", startDirectory: str = "/", maxReadBytes: int = 67108864, maxWriteBytes: int = 67108864, maxPacketBytes: int = 32768, maxConnections: int = 256, handshakeTimeoutMs: int = 10000, idleTimeoutMs: int = 300000, maxAuthTries: int = 6, authAttemptsPerSecond: int = 20, authBurst: int = 40) {
         self.hostKey: str = hostKey
         self.hostKeys: list[str] = []
+        #- Host keys announced to clients (OpenSSH ``hostkeys-00`` /
+           UpdateHostKeys) without being offered in the handshake: the next
+           keys of a rotation. -#
+        self.announcedHostKeys: list[str] = []
+        #- Accept OpenSSH user certificates (verified: CA signature, validity,
+           the username among the principals, ``source-address``); the
+           public-key callback decides whether the CA is trusted. -#
+        self.userCertificates: bool = false
         if hostKey != "" {
             self.hostKeys.append(hostKey)
         }
@@ -192,6 +200,26 @@ class SftpConfig {
         return self
     }
 
+    #- Announces ``key`` (after authentication, ``hostkeys-00@openssh.com``)
+       without offering it in the handshake, so clients that support
+       UpdateHostKeys learn it before it becomes a served key. -#
+    func announceHostKey(self, key: str) -> SftpConfig {
+        if key != "" {
+            self.announcedHostKeys.append(key)
+        }
+        return self
+    }
+
+    func announceHostKeyFile(self, path: str) -> Result[SftpConfig] {
+        key: str = Os.readFile(path)?
+        return Result.Ok(self.announceHostKey(key))
+    }
+
+    func withUserCertificates(self, enabled: bool = true) -> SftpConfig {
+        self.userCertificates = enabled
+        return self
+    }
+
     func addHostKeyFile(self, path: str) -> Result[SftpConfig] {
         key: str = Os.readFile(path)?
         return Result.Ok(self.addHostKey(key))
@@ -319,5 +347,43 @@ class SftpKey {
 
     static func readFile(path: str) -> Result[str] {
         return Os.readFile(path)
+    }
+
+    #- ``SHA256:...`` fingerprint of the public half of ``privateKey`` (what
+       clients show and compare). -#
+    static func fingerprint(privateKey: str) -> Result[str] {
+        out: str = ""
+        failure: str = ""
+        go! {
+            fingerprint, _, err := lamSftpKeyInfo(privateKey)
+            if err != nil {
+                failure = err.Error()
+            } else {
+                out = fingerprint
+            }
+        }
+        if failure != "" {
+            return Result.Err(Error("SftpKeyError", f"parse host key: {failure}", None))
+        }
+        return Result.Ok(out)
+    }
+
+    #- The public half of ``privateKey`` as an authorized_keys / known_hosts
+       line (``ssh-ed25519 AAAA...``). -#
+    static func publicKey(privateKey: str) -> Result[str] {
+        out: str = ""
+        failure: str = ""
+        go! {
+            _, authorized, err := lamSftpKeyInfo(privateKey)
+            if err != nil {
+                failure = err.Error()
+            } else {
+                out = authorized
+            }
+        }
+        if failure != "" {
+            return Result.Err(Error("SftpKeyError", f"parse host key: {failure}", None))
+        }
+        return Result.Ok(out)
     }
 }

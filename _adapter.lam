@@ -9,6 +9,7 @@ go! {
     import (
         "bufio"
         "bytes"
+        cryptorand "crypto/rand"
         "encoding/binary"
         "errors"
         "fmt"
@@ -25,6 +26,367 @@ go! {
         pkgsftp "github.com/pkg/sftp"
         "golang.org/x/crypto/ssh"
     )
+
+    // ── host key rotation: OpenSSH hostkeys-00 / hostkeys-prove-00 ──────
+
+    // lamSftpAnnounceHostKeys tells the client every host key of the server
+    // (served and announced), so OpenSSH clients with UpdateHostKeys add the
+    // ones they do not know to known_hosts after proving them.
+    func lamSftpAnnounceHostKeys(conn *ssh.ServerConn, signers []ssh.Signer) {
+        if len(signers) == 0 {
+            return
+        }
+        var payload []byte
+        for _, signer := range signers {
+            payload = append(payload, ssh.Marshal(struct{ Key []byte }{signer.PublicKey().Marshal()})...)
+        }
+        _, _, _ = conn.SendRequest("hostkeys-00@openssh.com", false, payload)
+    }
+
+    // lamSftpGlobalRequests answers hostkeys-prove-00@openssh.com: for each
+    // requested key a signature over the session identifier made with that
+    // key; anything else is refused.
+    func lamSftpGlobalRequests(conn *ssh.ServerConn, requests <-chan *ssh.Request, signers []ssh.Signer) {
+        for request := range requests {
+            if request.Type != "hostkeys-prove-00@openssh.com" {
+                if request.WantReply {
+                    _ = request.Reply(false, nil)
+                }
+                continue
+            }
+            ok := true
+            var reply []byte
+            rest := request.Payload
+            for len(rest) > 0 && ok {
+                var item struct {
+                    Key  []byte
+                    Rest []byte `ssh:"rest"`
+                }
+                if err := ssh.Unmarshal(rest, &item); err != nil {
+                    ok = false
+                    break
+                }
+                rest = item.Rest
+                var signer ssh.Signer
+                for _, candidate := range signers {
+                    if bytes.Equal(candidate.PublicKey().Marshal(), item.Key) {
+                        signer = candidate
+                        break
+                    }
+                }
+                if signer == nil {
+                    ok = false
+                    break
+                }
+                data := ssh.Marshal(struct {
+                    Name      string
+                    SessionID []byte
+                    Key       []byte
+                }{"hostkeys-prove-00@openssh.com", conn.SessionID(), item.Key})
+                var signature *ssh.Signature
+                var err error
+                if algorithmSigner, isAlgorithm := signer.(ssh.AlgorithmSigner); isAlgorithm && signer.PublicKey().Type() == ssh.KeyAlgoRSA {
+                    signature, err = algorithmSigner.SignWithAlgorithm(cryptorand.Reader, data, ssh.KeyAlgoRSASHA512)
+                } else {
+                    signature, err = signer.Sign(cryptorand.Reader, data)
+                }
+                if err != nil {
+                    ok = false
+                    break
+                }
+                reply = append(reply, ssh.Marshal(struct{ Signature []byte }{ssh.Marshal(signature)})...)
+            }
+            if request.WantReply {
+                if ok {
+                    _ = request.Reply(true, reply)
+                } else {
+                    _ = request.Reply(false, nil)
+                }
+            }
+        }
+    }
+
+    // lamSftpKeyInfo: SHA256 fingerprint and authorized_keys line of the
+    // public half of a private key.
+    func lamSftpKeyInfo(privateKey string) (string, string, error) {
+        signer, err := ssh.ParsePrivateKey([]byte(privateKey))
+        if err != nil {
+            return "", "", err
+        }
+        public := signer.PublicKey()
+        return ssh.FingerprintSHA256(public), strings.TrimSpace(string(ssh.MarshalAuthorizedKey(public))), nil
+    }
+
+    // ── user certificates ───────────────────────────────────────────────
+
+    // lamSftpCheckCertificate verifies an OpenSSH user certificate (CA
+    // signature, validity, principals, source-address) and fills auth.
+    func lamSftpCheckCertificate(meta ssh.ConnMetadata, cert *ssh.Certificate, auth *SftpAuth) error {
+        checker := &ssh.CertChecker{
+            IsUserAuthority:          func(ssh.PublicKey) bool { return true },
+            SupportedCriticalOptions: []string{"source-address"},
+        }
+        if _, err := checker.Authenticate(meta, cert); err != nil {
+            return err
+        }
+        // CertChecker leaves source-address to the server's handshake, which
+        // only sees options returned in Permissions: check it here.
+        if allowed, ok := cert.CriticalOptions["source-address"]; ok {
+            host, _, err := net.SplitHostPort(meta.RemoteAddr().String())
+            if err != nil {
+                return err
+            }
+            ip := net.ParseIP(host)
+            matched := false
+            for _, item := range strings.Split(allowed, ",") {
+                item = strings.TrimSpace(item)
+                if _, network, err := net.ParseCIDR(item); err == nil {
+                    matched = matched || (ip != nil && network.Contains(ip))
+                } else if single := net.ParseIP(item); single != nil {
+                    matched = matched || single.Equal(ip)
+                } else {
+                    return fmt.Errorf("certificate source-address: invalid entry %q", item)
+                }
+            }
+            if !matched {
+                return fmt.Errorf("certificate source-address does not allow %s", host)
+            }
+        }
+        auth.Certificate = true
+        auth.CertKeyId = cert.KeyId
+        auth.CertSerial = int(cert.Serial)
+        auth.CertPrincipals = append([]string(nil), cert.ValidPrincipals...)
+        auth.CertAuthority = strings.TrimSpace(string(ssh.MarshalAuthorizedKey(cert.SignatureKey)))
+        auth.CertAuthorityFingerprint = ssh.FingerprintSHA256(cert.SignatureKey)
+        auth.CertValidAfter = int(cert.ValidAfter)
+        if cert.ValidBefore != ssh.CertTimeInfinity && cert.ValidBefore < 1<<62 {
+            auth.CertValidBefore = int(cert.ValidBefore)
+        }
+        auth.PublicKey = strings.TrimSpace(string(ssh.MarshalAuthorizedKey(cert.Key)))
+        auth.Fingerprint = ssh.FingerprintSHA256(cert.Key)
+        return nil
+    }
+
+    // ── fsync@openssh.com ───────────────────────────────────────────────
+
+    // lamSftpFsyncShim sits between the SSH channel and pkg/sftp (which has
+    // no server-side fsync): it advertises fsync@openssh.com in the version
+    // packet, tracks which path each handle opened and which writes are
+    // still outstanding, and answers fsync requests itself once the writes
+    // received before them have been answered.
+    type lamSftpFsyncShim struct {
+        channel     io.ReadWriteCloser
+        backend     *lamSftpBackend
+        writeMu     sync.Mutex
+        mu          sync.Mutex
+        drained     *sync.Cond
+        incoming    []byte
+        deliver     []byte
+        outgoing    []byte
+        opens       map[uint32]string
+        closes      map[uint32]string
+        handles     map[string]string
+        pending     map[string]map[uint32]bool
+        writeHandle map[uint32]string
+    }
+
+    func lamSftpNewFsyncShim(channel io.ReadWriteCloser, backend *lamSftpBackend) *lamSftpFsyncShim {
+        shim := &lamSftpFsyncShim{
+            channel:     channel,
+            backend:     backend,
+            opens:       map[uint32]string{},
+            closes:      map[uint32]string{},
+            handles:     map[string]string{},
+            pending:     map[string]map[uint32]bool{},
+            writeHandle: map[uint32]string{},
+        }
+        shim.drained = sync.NewCond(&shim.mu)
+        return shim
+    }
+
+    func lamSftpWireString(b []byte) (string, []byte, bool) {
+        if len(b) < 4 {
+            return "", nil, false
+        }
+        n := binary.BigEndian.Uint32(b)
+        if uint64(len(b)-4) < uint64(n) {
+            return "", nil, false
+        }
+        return string(b[4 : 4+n]), b[4+n:], true
+    }
+
+    func (s *lamSftpFsyncShim) Read(p []byte) (int, error) {
+        for len(s.deliver) == 0 {
+            buf := make([]byte, 32768)
+            n, err := s.channel.Read(buf)
+            if n > 0 {
+                s.incoming = append(s.incoming, buf[:n]...)
+                s.parseIncoming()
+            }
+            if err != nil && len(s.deliver) == 0 {
+                return 0, err
+            }
+        }
+        n := copy(p, s.deliver)
+        s.deliver = s.deliver[n:]
+        return n, nil
+    }
+
+    func (s *lamSftpFsyncShim) parseIncoming() {
+        for len(s.incoming) >= 5 {
+            length := binary.BigEndian.Uint32(s.incoming)
+            if uint64(len(s.incoming)-4) < uint64(length) {
+                return
+            }
+            packet := s.incoming[:4+length]
+            s.incoming = s.incoming[4+length:]
+            body := packet[4:]
+            kind := body[0]
+            forward := true
+            if len(body) >= 5 {
+                id := binary.BigEndian.Uint32(body[1:5])
+                rest := body[5:]
+                s.mu.Lock()
+                switch kind {
+                case 3: // SSH_FXP_OPEN
+                    if name, _, ok := lamSftpWireString(rest); ok {
+                        s.opens[id] = name
+                    }
+                case 4: // SSH_FXP_CLOSE
+                    if handle, _, ok := lamSftpWireString(rest); ok {
+                        s.closes[id] = handle
+                    }
+                case 6: // SSH_FXP_WRITE
+                    if handle, _, ok := lamSftpWireString(rest); ok {
+                        if s.pending[handle] == nil {
+                            s.pending[handle] = map[uint32]bool{}
+                        }
+                        s.pending[handle][id] = true
+                        s.writeHandle[id] = handle
+                    }
+                case 200: // SSH_FXP_EXTENDED
+                    if name, after, ok := lamSftpWireString(rest); ok && name == "fsync@openssh.com" {
+                        if handle, _, ok := lamSftpWireString(after); ok {
+                            forward = false
+                            go s.fsync(id, handle)
+                        }
+                    }
+                }
+                s.mu.Unlock()
+            }
+            if forward {
+                s.deliver = append(s.deliver, packet...)
+            }
+        }
+    }
+
+    func (s *lamSftpFsyncShim) Write(p []byte) (int, error) {
+        s.writeMu.Lock()
+        defer s.writeMu.Unlock()
+        s.outgoing = append(s.outgoing, p...)
+        for len(s.outgoing) >= 5 {
+            length := binary.BigEndian.Uint32(s.outgoing)
+            if uint64(len(s.outgoing)-4) < uint64(length) {
+                break
+            }
+            packet := append([]byte(nil), s.outgoing[:4+length]...)
+            s.outgoing = s.outgoing[4+length:]
+            body := packet[4:]
+            switch body[0] {
+            case 2: // SSH_FXP_VERSION: advertise fsync@openssh.com
+                ext := append(ssh.Marshal(struct{ Name string }{"fsync@openssh.com"}), ssh.Marshal(struct{ Version string }{"1"})...)
+                body = append(body, ext...)
+                packet = make([]byte, 4, 4+len(body))
+                binary.BigEndian.PutUint32(packet, uint32(len(body)))
+                packet = append(packet, body...)
+            case 102: // SSH_FXP_HANDLE
+                if len(body) >= 5 {
+                    id := binary.BigEndian.Uint32(body[1:5])
+                    if handle, _, ok := lamSftpWireString(body[5:]); ok {
+                        s.mu.Lock()
+                        if name, known := s.opens[id]; known {
+                            s.handles[handle] = name
+                            delete(s.opens, id)
+                        }
+                        s.mu.Unlock()
+                    }
+                }
+            case 101: // SSH_FXP_STATUS
+                if len(body) >= 5 {
+                    id := binary.BigEndian.Uint32(body[1:5])
+                    s.mu.Lock()
+                    delete(s.opens, id)
+                    if handle, known := s.writeHandle[id]; known {
+                        delete(s.pending[handle], id)
+                        delete(s.writeHandle, id)
+                        s.drained.Broadcast()
+                    }
+                    if handle, known := s.closes[id]; known {
+                        delete(s.handles, handle)
+                        delete(s.pending, handle)
+                        delete(s.closes, id)
+                    }
+                    s.mu.Unlock()
+                }
+            }
+            if _, err := s.channel.Write(packet); err != nil {
+                return 0, err
+            }
+        }
+        return len(p), nil
+    }
+
+    func (s *lamSftpFsyncShim) status(id uint32, code uint32, message string) {
+        body := []byte{101}
+        body = binary.BigEndian.AppendUint32(body, id)
+        body = binary.BigEndian.AppendUint32(body, code)
+        body = append(body, ssh.Marshal(struct {
+            Message string
+            Lang    string
+        }{message, ""})...)
+        packet := binary.BigEndian.AppendUint32(nil, uint32(len(body)))
+        packet = append(packet, body...)
+        s.writeMu.Lock()
+        _, _ = s.channel.Write(packet)
+        s.writeMu.Unlock()
+    }
+
+    func (s *lamSftpFsyncShim) fsync(id uint32, handle string) {
+        defer func() {
+            if recovered := recover(); recovered != nil {
+                s.status(id, 4, fmt.Sprintf("fsync failed: %v", recovered))
+            }
+        }()
+        s.mu.Lock()
+        for len(s.pending[handle]) > 0 {
+            s.drained.Wait()
+        }
+        name, ok := s.handles[handle]
+        s.mu.Unlock()
+        if !ok {
+            s.status(id, 4, "fsync: unknown handle")
+            return
+        }
+        request := NewSftpRequest()
+        request.Method = "Fsync"
+        request.Path = path.Clean("/" + name)
+        request.User = s.backend.user
+        request.RemoteAddress = s.backend.remote
+        request.Session = make(map[string]string, len(s.backend.session))
+        for key, value := range s.backend.session {
+            request.Session[key] = value
+        }
+        result := s.backend.handlers.DispatchFsync(request)
+        if err := lamSftpResultError(result); err != nil {
+            s.status(id, 4, err.Error())
+            return
+        }
+        s.status(id, 0, "")
+    }
+
+    func (s *lamSftpFsyncShim) Close() error {
+        return s.channel.Close()
+    }
 
     var lamSftpExtensionsOnce sync.Once
     var lamSftpExtensionsError error
@@ -54,6 +416,8 @@ go! {
         fallbackConfig *ssh.ServerConfig
         maxConnections int
         idleTimeout    time.Duration
+        // Served and announced host keys (hostkeys-00 / hostkeys-prove-00).
+        hostSigners    []ssh.Signer
         wg             sync.WaitGroup
     }
 
@@ -967,8 +1331,12 @@ go! {
                         // retain their ``data`` slice (documented contract).
                         options = append(options, pkgsftp.WithRSAllocator())
                     }
+                    var stream io.ReadWriteCloser = channel
+                    if server.Handlers.HasFsync {
+                        stream = lamSftpNewFsyncShim(channel, backend)
+                    }
                     requestServer := pkgsftp.NewRequestServer(
-                        channel,
+                        stream,
                         pkgsftp.Handlers{
                             FileGet:  backend,
                             FilePut:  backend,
@@ -1282,7 +1650,8 @@ go! {
         }
         defer connection.Close()
         runtime.track(raw, connection)
-        go ssh.DiscardRequests(requests)
+        lamSftpAnnounceHostKeys(connection, runtime.hostSigners)
+        go lamSftpGlobalRequests(connection, requests, runtime.hostSigners)
         lamSftpServeChannels(connection, channels, server)
     }
 }

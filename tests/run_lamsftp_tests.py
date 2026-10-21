@@ -108,6 +108,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="@lam/sftp package tests")
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--race", action="store_true", help="build tests with Go's race detector")
+    parser.add_argument("-k", "--filter", default="", help="only tests whose file name contains this text")
     args = parser.parse_args()
     if not _check_compiler():
         raise SystemExit(1)
@@ -118,7 +119,7 @@ def main() -> None:
         )
         raise SystemExit(1)
 
-    cases = sorted((LIB_ROOT / "tests").glob("offline_*.lam"))
+    cases = sorted(p for p in (LIB_ROOT / "tests").glob("offline_*.lam") if args.filter in p.name)
     failures: list[tuple[Path, str]] = []
     print(f"Running {len(cases)} @lam/sftp test(s)...\n")
     for case in cases:

@@ -153,9 +153,37 @@ hostKey: str = SftpKey.generate()?
 config: SftpConfig = SftpConfig(hostKey)
 ```
 
-Ephemeral keys are intended for tests or short-lived development servers. For
-fingerprints, authorized public keys, passphrases, and parsing, use the full
-`SshKeyPair` API from `@lam/ssh` directly.
+Ephemeral keys are intended for tests or short-lived development servers.
+`SftpKey.fingerprint(privateKey)` (`SHA256:...`) and
+`SftpKey.publicKey(privateKey)` (a known_hosts line) give what clients see; for
+passphrases and parsing, use the full `SshKeyPair` API from `@lam/ssh`.
+
+### Rotating the host key
+
+A server offers one key per algorithm in the handshake, so replacing a key
+makes clients that pinned the old one refuse to connect. `announceHostKey`
+lets clients learn the next key first:
+
+```lammergeier
+config: SftpConfig = SftpConfig(currentKey).announceHostKey(nextKey)
+```
+
+After authentication the server sends every key (served and announced) in an
+OpenSSH `hostkeys-00@openssh.com` message and proves possession on request
+(`hostkeys-prove-00@openssh.com`, signatures over the session identifier). OpenSSH
+clients with `UpdateHostKeys` (on by default for unhashed `known_hosts`) add the
+announced keys to `known_hosts`. Rotation:
+
+1. **Announce.** Serve the current key and announce the next one; publish
+   both fingerprints. Clients learn the next key as they connect.
+2. **Swap.** After a transition period, serve the next key and announce the
+   old one (clients that learned the new key accept it at once).
+3. **Drop.** Remove the old key.
+
+Clients without UpdateHostKeys (most libraries, WinSCP, older OpenSSH) still
+see a changed key at step 2 and must update their pin manually. For those, run
+a second listener with the old key during the transition, or tell them the new
+fingerprint in advance.
 
 ## Quick start with callbacks
 
@@ -292,6 +320,33 @@ Password auth receives `username`, `password`, `remoteAddress`, and
 OpenSSH authorized-key format, `fingerprint`, `remoteAddress`, and
 `method = "publicKey"`.
 
+**User certificates.** With `SftpConfig.withUserCertificates()` the server
+accepts OpenSSH user certificates (`ssh-keygen -s ca -I key-id -n alice
+-V +52w id_ed25519.pub`). Before your public-key callback runs, the library
+checks the CA signature, the validity window, that the username is among the
+principals, and the `source-address` critical option. Certificates with other
+critical options (e.g. `force-command`) are refused. The callback then sees:
+
+- `method = "certificate"`, `certificate = true`;
+- `certAuthority` / `certAuthorityFingerprint` (the signing CA);
+- `certKeyId`, `certSerial`, `certPrincipals`;
+- `certValidAfter` / `certValidBefore` (Unix seconds; `0` = no expiry);
+- `publicKey` / `fingerprint` of the certified key.
+
+The callback decides whether that CA is trusted for that user, and can refuse
+revoked serials or key ids:
+
+```lammergeier
+func authenticate(auth: SftpAuth) -> bool {
+    if auth.certificate {
+        return trustedCAs(auth.username).contains(auth.certAuthorityFingerprint) and not revoked(auth.certSerial)
+    }
+    return authorizedKeys(auth.username).contains(auth.fingerprint)
+}
+```
+
+Refused certificates count as failed attempts (rate limits, lockout).
+
 An auth callback can attach non-secret routing information to the session:
 
 ```lammergeier
@@ -421,6 +476,13 @@ func install(server: SftpServer) {
 - `onPosixRename` preserves POSIX-rename semantics instead of falling back to
   ordinary v3 rename.
 - `onLink` handles `hardlink@openssh.com`.
+- `onFsync` handles `fsync@openssh.com` (OpenSSH `sftp put -f`,
+  `rclone`, `pkg/sftp` `File.Sync`). It is advertised only when the callback
+  is set. The callback runs with the open file's `path` once every write the
+  client sent before the fsync on that handle has been applied; make the data
+  written so far durable and return `Result.Ok(true)`, or an error the client
+  receives. pkg/sftp has no server-side fsync, so a thin packet layer in front
+  of it answers these requests.
 
 `SftpFile` exposes `uid`, `gid`, and `extended: list[SftpExtended]`; these are
 encoded through `FileInfoUidGid` and `FileInfoExtendedData` on directory and

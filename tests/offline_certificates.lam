@@ -1,0 +1,139 @@
+# OpenSSH user certificates: with withUserCertificates() a certificate
+# signed by a CA is verified (signature, validity window, principals,
+# source-address) and the public-key callback sees the CA and certificate
+# details to decide whether the CA is trusted.
+#
+# expect: valid=ok method=certificate keyId=alice@laptop serial=42 principals=alice,ops ca=trusted expires=true
+# expect: wrong-principal=refused
+# expect: expired=refused
+# expect: untrusted-ca=refused
+# expect: wrong-source=refused
+# expect: plain-key=ok method=publicKey
+# expect: disabled=refused
+# expect: failures-counted=true
+
+from @lam/sftp import SftpAuth, SftpConfig, SftpKey, SftpServer
+from lamerrors import Result
+
+go! {
+    import (
+        "crypto/ed25519"
+        "crypto/rand"
+        "time"
+
+        "golang.org/x/crypto/ssh"
+    )
+
+    var certCA, certOtherCA, certUser ssh.Signer
+
+    func certSetup() string {
+        mk := func() ssh.Signer {
+            _, priv, _ := ed25519.GenerateKey(rand.Reader)
+            signer, _ := ssh.NewSignerFromKey(priv)
+            return signer
+        }
+        certCA, certOtherCA, certUser = mk(), mk(), mk()
+        return ssh.FingerprintSHA256(certCA.PublicKey())
+    }
+
+    func certIssue(ca ssh.Signer, principals []string, after, before time.Time, source string) ssh.Signer {
+        cert := &ssh.Certificate{Key: certUser.PublicKey(), CertType: ssh.UserCert, KeyId: "alice@laptop", Serial: 42,
+            ValidPrincipals: principals, ValidAfter: uint64(after.Unix()), ValidBefore: uint64(before.Unix())}
+        if source != "" {
+            cert.Permissions.CriticalOptions = map[string]string{"source-address": source}
+        }
+        if err := cert.SignCert(rand.Reader, ca); err != nil {
+            panic(err)
+        }
+        signer, err := ssh.NewCertSigner(cert, certUser)
+        if err != nil {
+            panic(err)
+        }
+        return signer
+    }
+
+    func certDial(address, user string, signer ssh.Signer) string {
+        cfg := &ssh.ClientConfig{User: user, Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)}, HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: 5 * time.Second}
+        client, err := ssh.Dial("tcp", address, cfg)
+        if err != nil {
+            return "refused"
+        }
+        client.Close()
+        return "ok"
+    }
+}
+
+class Seen {
+    static last: str = ""
+}
+
+trustedCa: str = ""
+
+func check(auth: SftpAuth) -> bool {
+    Seen.last = f"method={auth.method}"
+    if auth.certificate {
+        trusted: str = "trusted" if auth.certAuthorityFingerprint == trustedCa else "untrusted"
+        Seen.last = f"method={auth.method} keyId={auth.certKeyId} serial={auth.certSerial} principals={','.join(auth.certPrincipals)} ca={trusted} expires={auth.certValidBefore > 0}"
+        return auth.certAuthorityFingerprint == trustedCa
+    }
+    return auth.publicKey != ""
+}
+
+func run() -> Result[bool] {
+    go! {
+        trustedCa = certSetup()
+    }
+    config: SftpConfig = SftpConfig(SftpKey.generate()?, "127.0.0.1:0").withUserCertificates()
+    server: SftpServer = SftpServer(config)
+    _ = server.onPublicKeyAuth(check)
+    _ = server.listenBackground()?
+    address: str = server.boundAddress
+    out: list[str] = []
+    go! {
+        now := time.Now()
+        hour := time.Hour
+        out = append(out, certDial(address, "alice", certIssue(certCA, []string{"alice", "ops"}, now.Add(-time.Minute), now.Add(hour), "127.0.0.0/8")))
+    }
+    print(f"valid={out[0]} {Seen.last}")
+    go! {
+        {
+        now := time.Now()
+        hour := time.Hour
+        out = append(out, certDial(address, "bob", certIssue(certCA, []string{"alice"}, now.Add(-time.Minute), now.Add(hour), "")))
+        out = append(out, certDial(address, "alice", certIssue(certCA, []string{"alice"}, now.Add(-2*hour), now.Add(-hour), "")))
+        out = append(out, certDial(address, "alice", certIssue(certOtherCA, []string{"alice"}, now.Add(-time.Minute), now.Add(hour), "")))
+        out = append(out, certDial(address, "alice", certIssue(certCA, []string{"alice"}, now.Add(-time.Minute), now.Add(hour), "10.0.0.0/8")))
+        out = append(out, certDial(address, "alice", certUser))
+        }
+    }
+    print(f"wrong-principal={out[1]}")
+    print(f"expired={out[2]}")
+    print(f"untrusted-ca={out[3]}")
+    print(f"wrong-source={out[4]}")
+    print(f"plain-key={out[5]} {Seen.last}")
+    failures: int = server.metrics.authFailed.get()
+    server.shutdown()
+
+    plain: SftpServer = SftpServer(SftpConfig(SftpKey.generate()?, "127.0.0.1:0"))
+    _ = plain.onPublicKeyAuth(check)
+    _ = plain.listenBackground()?
+    plainAddress: str = plain.boundAddress
+    disabled: str = ""
+    go! {
+        {
+        now := time.Now()
+        disabled = certDial(plainAddress, "alice", certIssue(certCA, []string{"alice"}, now.Add(-time.Minute), now.Add(time.Hour), ""))
+        }
+    }
+    print(f"disabled={disabled}")
+    print(f"failures-counted={failures >= 4}")
+    plain.shutdown()
+    return Result.Ok(true)
+}
+
+func main() {
+    r: Result[bool] = run()
+    if not r.ok() {
+        print(f"error: {r.error}")
+    }
+}

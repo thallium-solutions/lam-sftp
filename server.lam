@@ -142,6 +142,12 @@ class SftpServer {
         return self
     }
 
+    #- ``fsync@openssh.com`` (see ``SftpHandlers.onFsync``). -#
+    func onFsync(self, callback: func(SftpRequest) -> Result[bool]) -> SftpServer {
+        _ = self.handlers.onFsync(callback)
+        return self
+    }
+
     func onCloseWrite(self, callback: func(SftpRequest) -> Result[bool]) -> SftpServer {
         self.handlers.onCloseWrite(callback)
         return self
@@ -385,18 +391,27 @@ class SftpServer {
             if len(s.Config.Macs) > 0 {
                 sshConfig.Config.MACs = append([]string(nil), s.Config.Macs...)
             }
-            for _, keyText := range s.Config.HostKeys {
-                var signer ssh.Signer
-                var err error
+            var hostSigners []ssh.Signer
+            parseKey := func(keyText string) (ssh.Signer, error) {
                 if s.Config.HostKeyPassphrase == "" {
-                    signer, err = ssh.ParsePrivateKey([]byte(keyText))
-                } else {
-                    signer, err = ssh.ParsePrivateKeyWithPassphrase([]byte(keyText), []byte(s.Config.HostKeyPassphrase))
+                    return ssh.ParsePrivateKey([]byte(keyText))
                 }
+                return ssh.ParsePrivateKeyWithPassphrase([]byte(keyText), []byte(s.Config.HostKeyPassphrase))
+            }
+            for _, keyText := range s.Config.HostKeys {
+                signer, err := parseKey(keyText)
                 if err != nil {
                     return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("SftpListenError", fmt.Sprintf("parse host key: %v", err), nil))
                 }
                 sshConfig.AddHostKey(signer)
+                hostSigners = append(hostSigners, signer)
+            }
+            for _, keyText := range s.Config.AnnouncedHostKeys {
+                signer, err := parseKey(keyText)
+                if err != nil {
+                    return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("SftpListenError", fmt.Sprintf("parse announced host key: %v", err), nil))
+                }
+                hostSigners = append(hostSigners, signer)
             }
             if s.HasPasswordAuth {
                 sshConfig.PasswordCallback = func(meta ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
@@ -425,6 +440,16 @@ class SftpServer {
                     auth.Method = "publicKey"
                     auth.PublicKey = strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
                     auth.Fingerprint = ssh.FingerprintSHA256(key)
+                    if cert, isCert := key.(*ssh.Certificate); isCert {
+                        // Invalid or unwanted certificates count as failed
+                        // attempts (rate limits, lockout).
+                        if !s.Config.UserCertificates || lamSftpCheckCertificate(meta, cert, auth) != nil {
+                            s.RecordAuthOutcome(auth.RemoteAddress, false)
+                            s.Metrics.AuthFailed.Increment()
+                            return nil, errors.New("certificate refused")
+                        }
+                        auth.Method = "certificate"
+                    }
                     if !lamSftpAuthCall(s, auth, s.PublicKeyAuth) {
                         return nil, errors.New("authentication failed")
                     }
@@ -449,6 +474,7 @@ class SftpServer {
                 fallbackConfig: fallbackConfig,
                 maxConnections: s.Config.MaxConnections,
                 idleTimeout:    time.Duration(s.Config.IdleTimeoutMs) * time.Millisecond,
+                hostSigners:    hostSigners,
             }
             s._raw = runtime
             s.BoundAddress = listener.Addr().String()

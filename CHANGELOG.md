@@ -2,6 +2,29 @@
 
 All notable changes to `@lam/sftp` are documented here.
 
+## [3.6.0] - 2026-10-21
+
+### Added
+
+- Host key rotation: `SftpConfig.announceHostKey(key)` /
+  `announceHostKeyFile(path)` announce keys that are not offered in the
+  handshake. After authentication the server sends every host key in
+  `hostkeys-00@openssh.com` (OpenSSH UpdateHostKeys) and answers
+  `hostkeys-prove-00@openssh.com` with signatures over the session id.
+- `SftpKey.fingerprint(privateKey)` and `SftpKey.publicKey(privateKey)`.
+- OpenSSH user certificates: `SftpConfig.withUserCertificates()`. The CA
+  signature, validity, principals and `source-address` are verified before
+  the public-key callback, which receives the CA (`certAuthority`,
+  `certAuthorityFingerprint`) and the certificate (`certKeyId`, `certSerial`,
+  `certPrincipals`, `certValidAfter`, `certValidBefore`); `method` is
+  `certificate`. Refused certificates count as failed attempts.
+- `fsync@openssh.com`: `onFsync(callback)` on servers and handlers, called
+  after the writes sent before the fsync on that handle; advertised only
+  when set.
+- Global requests other than `hostkeys-prove-00@openssh.com` are refused
+  (they used to be discarded).
+- The test runner takes `-k <text>` to run matching tests only.
+
 ## [3.5.0] - 2026-10-20
 
 ### Added

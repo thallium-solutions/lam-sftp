@@ -1,0 +1,159 @@
+# fsync@openssh.com: advertised when onFsync is set; the callback runs after
+# every write sent before the fsync on that handle has been applied, with the
+# open file's path. Errors reach the client; without onFsync the extension is
+# not offered.
+#
+# expect: advertised=true
+# expect: sync=ok path=/data/report.csv bytes-at-sync=300000
+# expect: after=ok total=300015
+# expect: failing=error
+# expect: not-advertised=true unsupported
+
+from @lam/sftp import SftpAuth, SftpConfig, SftpErrors, SftpKey, SftpRequest, SftpServer
+from lamconcurrency import Mutex
+from lamerrors import Result
+
+go! {
+    import (
+        "os"
+        "strings"
+        "time"
+
+        clientsftp "github.com/pkg/sftp"
+        "golang.org/x/crypto/ssh"
+    )
+
+    func fsyncDial(address string) (*clientsftp.Client, error) {
+        cfg := &ssh.ClientConfig{User: "u", Auth: []ssh.AuthMethod{ssh.Password("x")}, HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: 5 * time.Second}
+        client, err := ssh.Dial("tcp", address, cfg)
+        if err != nil {
+            return nil, err
+        }
+        return clientsftp.NewClient(client, clientsftp.UseConcurrentWrites(true))
+    }
+
+    func fsyncExtension(c *clientsftp.Client) bool {
+        _, ok := c.HasExtension("fsync@openssh.com")
+        return ok
+    }
+
+    func fsyncWrite(c *clientsftp.Client, path string, chunks int, size int) (string, *clientsftp.File) {
+        f, err := c.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+        if err != nil {
+            return "create: " + err.Error(), nil
+        }
+        chunk := []byte(strings.Repeat("x", size))
+        for i := 0; i < chunks; i++ {
+            if _, err := f.Write(chunk); err != nil {
+                return "write: " + err.Error(), f
+            }
+        }
+        if err := f.Sync(); err != nil {
+            return "error", f
+        }
+        return "ok", f
+    }
+}
+
+class State {
+    static mu: Mutex = Mutex()
+    static written: int = 0
+    static atSync: int = -1
+    static syncPath: str = ""
+}
+
+func store(_request: SftpRequest, data: bytes, _offset: int) -> Result[int] {
+    State.mu.lock()
+    State.written += len(data)
+    State.mu.unlock()
+    return Result.Ok(len(data))
+}
+
+func fsync(request: SftpRequest) -> Result[bool] {
+    if request.path.startsWith("/fail") {
+        return SftpErrors.failure("storage unavailable")
+    }
+    State.mu.lock()
+    State.atSync = State.written
+    State.syncPath = request.path
+    State.mu.unlock()
+    return Result.Ok(true)
+}
+
+func accept(_auth: SftpAuth) -> bool {
+    return true
+}
+
+func run() -> Result[bool] {
+    server: SftpServer = SftpServer(SftpConfig(SftpKey.generate()?, "127.0.0.1:0"))
+    _ = server.onPasswordAuth(accept)
+    _ = server.onWriteAtBytes(store)
+    _ = server.onFsync(fsync)
+    _ = server.listenBackground()?
+    address: str = server.boundAddress
+    advertised: bool = false
+    synced: str = ""
+    after: str = ""
+    failing: str = ""
+    go! {
+        c, err := fsyncDial(address)
+        if err != nil {
+            synced = "dial: " + err.Error()
+        } else {
+            advertised = fsyncExtension(c)
+            var f *clientsftp.File
+            synced, f = fsyncWrite(c, "/data/report.csv", 10, 30000)
+            if f != nil {
+                if _, err := f.Write([]byte("tail!")); err == nil {
+                    after = "ok"
+                }
+                f.Close()
+            }
+            failing, f = fsyncWrite(c, "/fail.csv", 1, 10)
+            if f != nil {
+                f.Close()
+            }
+            c.Close()
+        }
+    }
+    print(f"advertised={advertised}")
+    print(f"sync={synced} path={State.syncPath} bytes-at-sync={State.atSync}")
+    print(f"after={after} total={State.written}")
+    print(f"failing={failing}")
+    server.shutdown()
+
+    plain: SftpServer = SftpServer(SftpConfig(SftpKey.generate()?, "127.0.0.1:0"))
+    _ = plain.onPasswordAuth(accept)
+    _ = plain.onWriteAtBytes(store)
+    _ = plain.listenBackground()?
+    plainAddress: str = plain.boundAddress
+    notAdvertised: bool = false
+    plainSync: str = ""
+    go! {
+        {
+        c, err := fsyncDial(plainAddress)
+        if err == nil {
+            notAdvertised = !fsyncExtension(c)
+            var f *clientsftp.File
+            plainSync, f = fsyncWrite(c, "/x.csv", 1, 10)
+            if plainSync == "error" {
+                plainSync = "unsupported"
+            }
+            if f != nil {
+                f.Close()
+            }
+            c.Close()
+        }
+        }
+    }
+    print(f"not-advertised={notAdvertised} {plainSync}")
+    plain.shutdown()
+    return Result.Ok(true)
+}
+
+func main() {
+    r: Result[bool] = run()
+    if not r.ok() {
+        print(f"error: {r.error}")
+    }
+}

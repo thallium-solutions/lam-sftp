@@ -36,6 +36,7 @@ class SftpHandlers {
         self.closeReadCallback: func(SftpRequest) -> Result[bool] = lambda(_request: SftpRequest) -> Result[bool]: Result.Ok(true)
         self.closeWriteCallback: func(SftpRequest) -> Result[bool] = lambda(_request: SftpRequest) -> Result[bool]: Result.Ok(true)
         self.openWriteCallback: func(SftpRequest) -> Result[bool] = lambda(_request: SftpRequest) -> Result[bool]: Result.Ok(true)
+        self.fsyncCallback: func(SftpRequest) -> Result[bool] = lambda(_request: SftpRequest) -> Result[bool]: SftpErrors.unsupported("fsync")
         self.transferErrorCallback: func(SftpRequest, any) = lambda(_request: SftpRequest, _error: any) -> None {
             _ = _error
         }
@@ -44,6 +45,7 @@ class SftpHandlers {
         self.hasReadAtBytes: bool = false
         self.hasWriteAtBytes: bool = false
         self.hasStatVFS: bool = false
+        self.hasFsync: bool = false
         self.hasRealPath: bool = false
         self.hasReadlink: bool = false
         self.commandCallbacks: dict[str, func(SftpRequest) -> Result[bool]] = {}
@@ -122,6 +124,27 @@ class SftpHandlers {
     func onCommand(self, callback: func(SftpRequest) -> Result[bool]) -> SftpHandlers {
         self.commandCallback = callback
         return self
+    }
+
+    #- ``fsync@openssh.com``: called once every write received before it on
+       the handle has been applied, with ``request.path`` the open file. Make
+       the data written so far durable; the extension is advertised only when
+       this callback is set. -#
+    func onFsync(self, callback: func(SftpRequest) -> Result[bool]) -> SftpHandlers {
+        self.fsyncCallback = callback
+        self.hasFsync = true
+        return self
+    }
+
+    func dispatchFsync(self, request: SftpRequest) -> Result[bool] {
+        before: Result = self._before(request)
+        if not before.ok() {
+            self._after(request, before)
+            return before
+        }
+        result: Result = self.fsyncCallback(request)
+        self._after(request, result)
+        return result
     }
 
     func onStatVFS(self, callback: func(SftpRequest) -> Result[SftpStatVFS]) -> SftpHandlers {

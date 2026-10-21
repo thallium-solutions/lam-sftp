@@ -1,0 +1,148 @@
+# Host key rotation: the served key is offered in the handshake; served and
+# announced keys are sent after authentication (hostkeys-00@openssh.com, as
+# OpenSSH's UpdateHostKeys expects) and the server proves them
+# (hostkeys-prove-00@openssh.com) with signatures over the session id.
+#
+# expect: handshake=current
+# expect: announced=2 current,next
+# expect: prove-next=ok signature-valid
+# expect: prove-unknown=refused
+# expect: fingerprints=true true
+
+from @lam/sftp import SftpAuth, SftpConfig, SftpKey, SftpRequest, SftpServer
+from lamerrors import Result
+
+go! {
+    import (
+        "bytes"
+        "crypto/ed25519"
+        "crypto/rand"
+        "net"
+        "strings"
+        "time"
+
+        "golang.org/x/crypto/ssh"
+    )
+
+    // rotationProbe connects, records the handshake host key, reads the
+    // hostkeys-00 announcement and asks the server to prove ``proveKey``.
+    func rotationProbe(address string, current, next ssh.PublicKey) []string {
+        name := func(k []byte) string {
+            switch {
+            case bytes.Equal(k, current.Marshal()):
+                return "current"
+            case bytes.Equal(k, next.Marshal()):
+                return "next"
+            }
+            return "other"
+        }
+        var handshake string
+        cfg := &ssh.ClientConfig{User: "u", Auth: []ssh.AuthMethod{ssh.Password("x")}, Timeout: 5 * time.Second,
+            HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error { handshake = name(key.Marshal()); return nil }}
+        raw, err := net.DialTimeout("tcp", address, 5*time.Second)
+        if err != nil {
+            return []string{"dial: " + err.Error()}
+        }
+        conn, _, reqs, err := ssh.NewClientConn(raw, address, cfg)
+        if err != nil {
+            return []string{"handshake: " + err.Error()}
+        }
+        defer conn.Close()
+        out := []string{handshake}
+        select {
+        case req := <-reqs:
+            var names []string
+            rest := req.Payload
+            for len(rest) > 0 {
+                var item struct {
+                    Key  []byte
+                    Rest []byte `ssh:"rest"`
+                }
+                if ssh.Unmarshal(rest, &item) != nil {
+                    break
+                }
+                names = append(names, name(item.Key))
+                rest = item.Rest
+            }
+            out = append(out, req.Type+" "+strings.Join(names, ","))
+        case <-time.After(5 * time.Second):
+            out = append(out, "no announcement")
+        }
+        ok, reply, err := conn.SendRequest("hostkeys-prove-00@openssh.com", true, ssh.Marshal(struct{ Key []byte }{next.Marshal()}))
+        if err != nil || !ok {
+            out = append(out, "refused")
+        } else {
+            var sigBlob struct {
+                Blob []byte
+                Rest []byte `ssh:"rest"`
+            }
+            var sig ssh.Signature
+            valid := false
+            if ssh.Unmarshal(reply, &sigBlob) == nil && ssh.Unmarshal(sigBlob.Blob, &sig) == nil {
+                data := ssh.Marshal(struct {
+                    Name      string
+                    SessionID []byte
+                    Key       []byte
+                }{"hostkeys-prove-00@openssh.com", conn.SessionID(), next.Marshal()})
+                valid = next.Verify(data, &sig) == nil
+            }
+            if valid {
+                out = append(out, "ok signature-valid")
+            } else {
+                out = append(out, "ok signature-invalid")
+            }
+        }
+        _, other, _ := ed25519.GenerateKey(rand.Reader)
+        otherSigner, _ := ssh.NewSignerFromKey(other)
+        ok, _, _ = conn.SendRequest("hostkeys-prove-00@openssh.com", true, ssh.Marshal(struct{ Key []byte }{otherSigner.PublicKey().Marshal()}))
+        if ok {
+            out = append(out, "accepted")
+        } else {
+            out = append(out, "refused")
+        }
+        return out
+    }
+
+    func rotationPublic(pem string) ssh.PublicKey {
+        signer, err := ssh.ParsePrivateKey([]byte(pem))
+        if err != nil {
+            panic(err)
+        }
+        return signer.PublicKey()
+    }
+}
+
+func accept(_auth: SftpAuth) -> bool {
+    return true
+}
+
+func run() -> Result[bool] {
+    current: str = SftpKey.generate()?
+    next: str = SftpKey.generate()?
+    config: SftpConfig = SftpConfig(current, "127.0.0.1:0").announceHostKey(next)
+    server: SftpServer = SftpServer(config)
+    _ = server.onPasswordAuth(accept)
+    _ = server.listenBackground()?
+    address: str = server.boundAddress
+    results: list[str] = []
+    go! {
+        results = rotationProbe(address, rotationPublic(current), rotationPublic(next))
+    }
+    print(f"handshake={results[0]}")
+    announced: str = results[1].replace("hostkeys-00@openssh.com ", "")
+    print(f"announced={len(announced.split(','))} {announced}")
+    print(f"prove-next={results[2]}")
+    print(f"prove-unknown={results[3]}")
+    fp: str = SftpKey.fingerprint(next)?
+    pub: str = SftpKey.publicKey(next)?
+    print(f"fingerprints={fp.startsWith('SHA256:')} {pub.startsWith('ssh-ed25519 ')}")
+    server.shutdown()
+    return Result.Ok(true)
+}
+
+func main() {
+    r: Result[bool] = run()
+    if not r.ok() {
+        print(f"error: {r.error}")
+    }
+}
