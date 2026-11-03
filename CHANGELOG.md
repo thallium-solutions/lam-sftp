@@ -2,6 +2,12 @@
 
 All notable changes to `@lam/sftp` are documented here.
 
+## [3.7.1] - 2026-11-03
+
+### Changed
+
+- Compatible with `lamc` 4.x: `compatibility.lamc = ">=1.18, <5"` (test runner too).
+
 ## [3.7.0] - 2026-11-12
 
 ### Added
