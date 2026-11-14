@@ -101,13 +101,13 @@ without a `v` prefix). Its manifest resolves the pinned `@lam/ssh` 3.0.0
 dependency transitively:
 
 ```bash
-lamc install https://github.com/thallium-solutions/lam-sftp.git@3.1.0
+lamc install https://github.com/thallium-solutions/lam-sftp.git@3.7.2
 ```
 
 After a registry release, use the canonical scoped name:
 
 ```bash
-lamc install @lam/sftp@3.1.0
+lamc install @lam/sftp@3.7.2
 ```
 
 For sibling-checkout development, declare the package in an application project

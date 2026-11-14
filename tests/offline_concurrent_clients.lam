@@ -1,0 +1,376 @@
+# Cross-feature stress: 12 SFTP clients started from async tasks upload
+# and download files concurrently through one server backed by a
+# byte-streaming `TenantStore` class (per-user directories chosen from the
+# authenticated session, a guard keeping each user in their directory).
+# Non-ASCII file names, binary payloads (every byte value) of different
+# sizes, path normalisation of `..` segments, a connection limit, read-only
+# denial and metrics, checked with `?`, `do/catch` and comprehensions.
+#
+# expect: listening=true
+# expect: uploads=12/12 digests-match=12
+# expect: names=[données/fichier-🦅-0.bin données/fichier-🦅-11.bin]
+# expect: sizes-distinct=12
+# expect: listing=12
+# expect: traversal=/u3/escape.txt
+# expect: cross-tenant=denied
+# expect: connection-limit=refused
+# expect: readonly=permission denied
+# expect: store-errors=SftpNotFound
+# expect: metrics=true
+# expect: stopped=true
+
+from @lam/sftp import SftpAuth, SftpConfig, SftpErrors, SftpFile, SftpHandlers, SftpKey, SftpRequest, SftpServer
+from lamconcurrency import Mutex
+from lamerrors import Result, Error
+
+go! {
+    import (
+        "bytes"
+        "crypto/sha256"
+        "errors"
+        "fmt"
+        "io"
+        "os"
+        "sort"
+        "strings"
+        "time"
+
+        clientsftp "github.com/pkg/sftp"
+        "golang.org/x/crypto/ssh"
+    )
+
+    func ccPayload(seed int, n int) []byte {
+        out := make([]byte, n)
+        for i := range out {
+            out[i] = byte((i*7 + seed*13) % 256)
+        }
+        return out
+    }
+
+    func ccDial(address string, user string) (*ssh.Client, *clientsftp.Client, error) {
+        config := &ssh.ClientConfig{User: user, Auth: []ssh.AuthMethod{ssh.Password("pw-" + user)}, HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: 5 * time.Second}
+        conn, err := ssh.Dial("tcp", address, config)
+        if err != nil {
+            return nil, nil, err
+        }
+        client, err := clientsftp.NewClient(conn)
+        if err != nil {
+            conn.Close()
+            return nil, nil, err
+        }
+        return conn, client, nil
+    }
+
+    // ccRoundTrip uploads a payload as user, downloads it and compares the
+    // digests; it returns "<path> <size> <match>" or an error.
+    func ccRoundTrip(address string, user string, seed int) (string, error) {
+        conn, client, err := ccDial(address, user)
+        if err != nil {
+            return "", err
+        }
+        defer conn.Close()
+        defer client.Close()
+        payload := ccPayload(seed, 65536+seed*977)
+        dir := "/" + user + "/données"
+        _ = client.Mkdir("/" + user)
+        _ = client.Mkdir(dir)
+        path := fmt.Sprintf("%s/fichier-🦅-%d.bin", dir, seed)
+        f, err := client.Create(path)
+        if err != nil {
+            return "", err
+        }
+        if _, err = f.ReadFrom(bytes.NewReader(payload)); err != nil {
+            return "", err
+        }
+        if err = f.Close(); err != nil {
+            return "", err
+        }
+        r, err := client.Open(path)
+        if err != nil {
+            return "", err
+        }
+        back, err := io.ReadAll(r)
+        r.Close()
+        if err != nil {
+            return "", err
+        }
+        return fmt.Sprintf("%s %d %v", path, len(back), sha256.Sum256(back) == sha256.Sum256(payload)), nil
+    }
+
+    func ccWrite(client *clientsftp.Client, path string, data string) error {
+        f, err := client.Create(path)
+        if err != nil {
+            return err
+        }
+        _, err = f.Write([]byte(data))
+        if closeErr := f.Close(); err == nil {
+            err = closeErr
+        }
+        return err
+    }
+
+    func ccErrorText(err error) string {
+        switch {
+        case err == nil:
+            return "ok"
+        case errors.Is(err, os.ErrPermission):
+            return "permission denied"
+        case errors.Is(err, os.ErrNotExist):
+            return "file does not exist"
+        }
+        return err.Error()
+    }
+}
+
+class TenantStore {
+    #- In-memory files keyed by path; each user sees only `/<user>/`. -#
+    func init(self) {
+        self.mu: Mutex = Mutex()
+        self.files: dict[str, bytes] = {}
+        self.paths: list[str] = []
+        self.missingReads: int = 0
+    }
+
+    func readAtBytes(self, request: SftpRequest, offset: int, length: int) -> Result[bytes] {
+        self.mu.lock()
+        defer self.mu.unlock()
+        if request.path not in self.files {
+            self.missingReads += 1
+            return SftpErrors.notFound(request.path)
+        }
+        data: bytes = self.files[request.path]
+        out: bytes = data
+        go! {
+            if offset >= len(data) {
+                out = []byte{}
+            } else {
+                end := offset + length
+                if end > len(data) {
+                    end = len(data)
+                }
+                out = data[offset:end]
+            }
+        }
+        return Result.Ok(out)
+    }
+
+    func writeAtBytes(self, request: SftpRequest, data: bytes, offset: int) -> Result[int] {
+        self.mu.lock()
+        defer self.mu.unlock()
+        current: bytes = go!([]byte{})
+        if request.path in self.files {
+            current = self.files[request.path]
+        } else {
+            self.paths.append(request.path)
+        }
+        go! {
+            need := offset + len(data)
+            if need > len(current) {
+                grown := make([]byte, need)
+                copy(grown, current)
+                current = grown
+            }
+            copy(current[offset:], data)
+        }
+        self.files[request.path] = current
+        return Result.Ok(len(data))
+    }
+
+    func closeRead(self, _request: SftpRequest) -> Result[bool] {
+        return Result.Ok(true)
+    }
+
+    func closeWrite(self, _request: SftpRequest) -> Result[bool] {
+        return Result.Ok(true)
+    }
+
+    func list(self, request: SftpRequest) -> Result[list[SftpFile]] {
+        if request.method == "Stat" or request.method == "Lstat" {
+            self.mu.lock()
+            defer self.mu.unlock()
+            if request.path in self.files {
+                return Result.Ok([SftpFile.file(request.path.split("/")[-1], len(self.files[request.path]))])
+            }
+            return Result.Ok([SftpFile.directory(request.path)])
+        }
+        self.mu.lock()
+        defer self.mu.unlock()
+        prefix: str = request.path.trimRight("/") + "/"
+        return Result.Ok([SftpFile.file(p[len(prefix):], len(self.files[p])) for p in self.paths if p.startsWith(prefix) and "/" not in p[len(prefix):]])
+    }
+
+    func command(self, _request: SftpRequest) -> Result[bool] {
+        return Result.Ok(true)
+    }
+
+    func ownPaths(self, user: str) -> list[str] {
+        self.mu.lock()
+        defer self.mu.unlock()
+        return sorted([p for p in self.paths if p.startsWith("/" + user + "/")])
+    }
+}
+
+func tenantGuard(request: SftpRequest) -> Result[bool] {
+    user: str = request.sessionValue("user")
+    return Result.Ok(request.path == "/" or request.path == "/" + user or request.path.startsWith("/" + user + "/"))
+}
+
+func authenticate(auth: SftpAuth) -> bool {
+    if auth.method != "password" or auth.password != "pw-" + auth.username {
+        return false
+    }
+    _ = auth.set("user", auth.username)
+    return true
+}
+
+func startServer(store: TenantStore, readOnly: bool, connectionLimit: int) -> Result[SftpServer] {
+    config: SftpConfig = SftpConfig(SftpKey.generate()?, "127.0.0.1:0").withConnectionLimit(connectionLimit)
+    handlers: SftpHandlers = SftpHandlers()
+    _ = handlers.useByteStreamingStorage(store)
+    _ = handlers.onList(store.list).onCommand(store.command)
+    _ = handlers.guard(tenantGuard)
+    _ = handlers.setReadOnly(readOnly)
+    server: SftpServer = SftpServer(config, handlers)
+    _ = server.onPasswordAuth(authenticate)
+    _ = server.listenBackground()?
+    return Result.Ok(server)
+}
+
+async func clientTask(address: str, user: str, seed: int) -> Result[str] {
+    line: str = ""
+    problem: str = ""
+    go! {
+        out, err := ccRoundTrip(address, user, seed)
+        if err != nil {
+            problem = err.Error()
+        } else {
+            line = out
+        }
+    }
+    if problem != "" {
+        return Result.Err(Error("ClientFailed", f"{user}: {problem}"))
+    }
+    return Result.Ok(line)
+}
+
+func run() -> Result[bool] {
+    store: TenantStore = TenantStore()
+    server: SftpServer = startServer(store, false, 64)?
+    print(f"listening={server.isListening()}")
+    address: str = server.boundAddress
+
+    pending = [clientTask(address, f"u{i}", i) for i in range(12)]
+    lines: list[str] = []
+    for task in pending {
+        r: Result[str] = await task
+        lines.append(r?)
+    }
+    print(f"uploads={len(lines)}/12 digests-match={len([l for l in lines if l.endsWith(' true')])}")
+    names: list[str] = [p[len("/u0/"):] for p in store.ownPaths("u0")] + [p[len("/u11/"):] for p in store.ownPaths("u11")]
+    print(f"names=[{' '.join(names)}]")
+    print(f"sizes-distinct={len(set([l.split(' ')[1] for l in lines]))}")
+
+    listing: int = 0
+    traversal: str = ""
+    crossTenant: str = ""
+    go! {
+    {
+        total := 0
+        for i := 0; i < 12; i++ {
+            conn, client, err := ccDial(address, fmt.Sprintf("u%d", i))
+            if err != nil {
+                panic(err)
+            }
+            entries, _ := client.ReadDir(fmt.Sprintf("/u%d/données", i))
+            total += len(entries)
+            client.Close()
+            conn.Close()
+        }
+        listing = total
+
+        conn, client, err := ccDial(address, "u3")
+        if err != nil {
+            panic(err)
+        }
+        // ".." segments are resolved before the request reaches the store:
+        // they cannot climb out of the virtual root.
+        if err := ccWrite(client, "/u3/données/../../../u3/./escape.txt", "x"); err != nil {
+            traversal = ccErrorText(err)
+        }
+        if crossErr := ccWrite(client, "/u4/données/intrusion.txt", "x"); errors.Is(crossErr, os.ErrPermission) {
+            crossTenant = "denied"
+        } else {
+            crossTenant = ccErrorText(crossErr)
+        }
+        client.Close()
+        conn.Close()
+    }
+    }
+    paths: list[str] = store.ownPaths("u3")
+    if traversal == "" {
+        traversal = [p for p in paths if p.endsWith("escape.txt")][0]
+    }
+    print(f"listing={listing}")
+    print(f"traversal={traversal}")
+    print(f"cross-tenant={crossTenant}")
+
+    limited: SftpServer = startServer(TenantStore(), false, 1)?
+    limitOutcome: str = ""
+    go! {
+    {
+        first, firstClient, err := ccDial(limited.BoundAddress, "u1")
+        if err != nil {
+            panic(err)
+        }
+        _, _, secondErr := ccDial(limited.BoundAddress, "u2")
+        if secondErr != nil {
+            limitOutcome = "refused"
+        } else {
+            limitOutcome = "accepted"
+        }
+        firstClient.Close()
+        first.Close()
+    }
+    }
+    print(f"connection-limit={limitOutcome}")
+    limited.close()
+
+    readOnly: SftpServer = startServer(TenantStore(), true, 8)?
+    readOnlyOutcome: str = ""
+    go! {
+    {
+        conn, client, err := ccDial(readOnly.BoundAddress, "u1")
+        if err != nil {
+            panic(err)
+        }
+        readOnlyOutcome = ccErrorText(ccWrite(client, "/u1/new.txt", "x"))
+        client.Close()
+        conn.Close()
+    }
+    }
+    print(f"readonly={readOnlyOutcome}")
+    readOnly.close()
+
+    request: SftpRequest = SftpRequest()
+    request.path = "/u0/missing.bin"
+    outcome: str = ""
+    do {
+        _ = store.readAtBytes(request, 0, 10)?
+        outcome = "found"
+    } catch err {
+        outcome = err.kind
+    }
+    print(f"store-errors={outcome}")
+    snapshot: dict[str, int] = server.metricsSnapshot()
+    print(f"metrics={snapshot['bytesWritten'] >= 12 * 65536 and snapshot['bytesRead'] >= 12 * 65536}")
+    server.close()
+    print(f"stopped={not server.isListening()}")
+    return Result.Ok(true)
+}
+
+func main() {
+    r: Result[bool] = run()
+    if not r.ok() {
+        print(f"unexpected: {r.error}")
+    }
+}

@@ -2,6 +2,19 @@
 
 All notable changes to `@lam/sftp` are documented here.
 
+## [3.7.2] - 2026-11-14
+
+### Tests
+
+- `tests/offline_concurrent_clients.lam`: 12 SFTP clients started from async
+  tasks upload and download binary files (every byte value, distinct sizes,
+  non-ASCII names) concurrently through one server backed by a byte-streaming
+  `TenantStore` class; per-user directories from the authenticated session
+  and a guard denying other tenants; directory listings; `..` segments
+  resolved inside the virtual root; a connection limit of 1; read-only
+  denial; typed store errors through `do/catch`; metrics. Clean under
+  `--race`.
+
 ## [3.7.1] - 2026-11-03
 
 ### Changed
